@@ -29,6 +29,7 @@ en el filesystem del backend.
 
 from __future__ import annotations
 
+import base64
 import asyncio
 import shutil
 import tempfile
@@ -83,6 +84,39 @@ def _run_decode_sync(workdir: Path, input_name: str, ecc: int) -> str:
         os.chdir(cwd_before)
 
 
+def _encode_debug_images(workdir: Path, filenames: list[str]) -> list[dict]:
+    """
+    Lee cada PNG de debug generado (relativo a workdir) y lo devuelve
+    como {"name": ..., "data": "data:image/png;base64,..."} listo
+    para mandar en la respuesta JSON. Si algun archivo no llego a
+    generarse (por ejemplo, el error ocurrio antes de esa fase), se
+    lo salta en silencio.
+    """
+    images = []
+    for name in filenames:
+        path = workdir / name
+        if not path.exists():
+            continue
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        images.append({"name": name, "data": f"data:image/png;base64,{encoded}"})
+    return images
+
+
+def _run_decode_sync(
+    workdir: Path, input_name: str, ecc: int, debug_images_out: list,
+) -> str:
+    import os
+
+    cwd_before = os.getcwd()
+    os.chdir(workdir)
+    try:
+        return read_camera_image_via_markers(
+            input_name, num_ecc_symbols=ecc, debug_images_out=debug_images_out,
+        )
+    finally:
+        os.chdir(cwd_before)
+
+
 @app.post("/generate")
 def generate(payload: dict):
     """
@@ -129,47 +163,42 @@ def generate(payload: dict):
         background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),
     )
 
-
 @app.post("/decode")
 async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBOLS)):
     """
-    Decodifica un Lancherix Visual Code a partir de una foto (con
-    perspectiva real arbitraria), usando los 4 corner markers.
-
-    multipart/form-data:
-        file : la imagen (jpg/png) capturada por la camara o subida
-        ecc  : (opcional) num_ecc_symbols, debe coincidir con el usado
-               al generar el codigo. Por defecto DEFAULT_ECC_SYMBOLS.
+    ... (docstring igual, se puede agregar una linea mencionando que
+    la respuesta incluye "images": [...] con las fotos de debug
+    generadas, incluso si hay error) ...
     """
     workdir = Path(tempfile.mkdtemp(prefix="lancherix_decode_"))
     suffix = Path(file.filename or "upload.png").suffix or ".png"
     input_path = workdir / f"input{suffix}"
+    debug_image_names: list[str] = []
 
     try:
         with open(input_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        # read_camera_image_via_markers escribe varios PNGs de debug
-        # junto al archivo de entrada (mismo stem); al vivir en
-        # `workdir` (temporal, por-request) no molestan ni persisten.
-        # Serializado por _decode_lock (ver nota arriba) y corrido en
-        # un thread aparte para no bloquear el event loop de asyncio.
         async with _decode_lock:
             text = await asyncio.to_thread(
-                _run_decode_sync, workdir, input_path.name, ecc,
+                _run_decode_sync, workdir, input_path.name, ecc, debug_image_names,
             )
 
-        return JSONResponse({"text": text})
+        images = _encode_debug_images(workdir, debug_image_names)
+        return JSONResponse({"text": text, "images": images})
 
     except ValueError as exc:
-        # Errores esperados del pipeline (no se detectaron los
-        # markers, no se pudo decodificar, checksum invalido, etc).
-        return JSONResponse({"error": str(exc)}, status_code=422)
+        images = _encode_debug_images(workdir, debug_image_names)
+        return JSONResponse(
+            {"error": str(exc), "images": images}, status_code=422,
+        )
 
     except Exception as exc:
         traceback.print_exc()
+        images = _encode_debug_images(workdir, debug_image_names)
         return JSONResponse(
-            {"error": f"Error interno al decodificar: {exc}"}, status_code=500,
+            {"error": f"Error interno al decodificar: {exc}", "images": images},
+            status_code=500,
         )
 
     finally:
