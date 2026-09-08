@@ -7,10 +7,15 @@ Convierte una fotografía en una imagen tipo scanner:
 - blancos más blancos
 - negros más negros
 - elimina gran parte de los grises
-- conserva tamaño, encuadre y geometría
+- conserva encuadre y geometría
 - NO recorta
 - NO rectifica
 - NO detecta markers
+
+Nota: si la imagen de entrada es chica (ej. webcam a 480x640), se
+hace un upscale interno antes de procesar -- ver _MIN_LONG_SIDE mas
+abajo. El output puede terminar mas grande que el input en ese caso;
+fotos ya grandes (celular) pasan sin cambios.
 
 Uso:
     python3 lancherix_scanner_preprocessor.py foto.png
@@ -26,7 +31,33 @@ import cv2
 import numpy as np
 
 
+_MIN_LONG_SIDE = 1600  # px - la deteccion de corner markers, Hough y la
+                       # lectura de la grilla dependen de tener suficientes
+                       # pixeles por modulo. A 480x640, cada modulo del
+                       # codigo ocupa apenas un puñado de pixeles reales;
+                       # este upscale interno (interpolacion cubica) le da
+                       # a todo el resto del pipeline mas pixeles para
+                       # trabajar. No inventa detalle real, pero evita que
+                       # blur/contraste/threshold operen sobre muy pocos
+                       # pixeles por modulo.
+
+
 def scanner_effect(image):
+    # ---------------------------------------------------------
+    # 0. Upscale si la imagen entra chica (ej. webcam a 480x640).
+    #    Fotos ya grandes (celular, 3024x4032) pasan sin cambios.
+    # ---------------------------------------------------------
+
+    h, w = image.shape[:2]
+    long_side = max(h, w)
+    if long_side < _MIN_LONG_SIDE:
+        scale = _MIN_LONG_SIDE / long_side
+        image = cv2.resize(
+            image,
+            (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
     # ---------------------------------------------------------
     # 1. Convertir a escala de grises
     # ---------------------------------------------------------
@@ -34,14 +65,33 @@ def scanner_effect(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     # ---------------------------------------------------------
-    # 2. Suavizado MUY ligero
-    #    Elimina pequeñas imperfecciones del papel.
+    # 2. Suavizado que preserva bordes.
+    #
+    #    Con pocos pixeles por modulo, un blur gaussiano comun
+    #    difumina los bordes de los markers casi tanto como el
+    #    ruido que busca eliminar. El filtro bilateral suaviza
+    #    ruido de sensor/compresion manteniendo los bordes nitidos
+    #    -- justo lo que Hough necesita despues para ubicar los
+    #    lados de los markers con precision.
     # ---------------------------------------------------------
 
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
 
     # ---------------------------------------------------------
-    # 3. Aumentar contraste
+    # 3. Ecualizacion de contraste LOCAL (CLAHE).
+    #
+    #    Las camaras web suelen tener auto-exposicion menos
+    #    uniforme que un telefono (una esquina del cuadro puede
+    #    quedar mas oscura). CLAHE normaliza el contraste por
+    #    regiones para que el paso 4 (contraste global + Otsu) no
+    #    se vea arrastrado por una zona mas oscura que el resto.
+    # ---------------------------------------------------------
+
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+
+    # ---------------------------------------------------------
+    # 4. Aumentar contraste
     #
     #    Empuja los valores claros hacia 255
     #    y los oscuros hacia 0.
@@ -62,7 +112,7 @@ def scanner_effect(image):
         contrast = gray
 
     # ---------------------------------------------------------
-    # 4. Threshold OTSU
+    # 5. Threshold OTSU
     #
     #    Convierte finalmente la imagen en:
     #
@@ -122,7 +172,8 @@ def main():
     print("==============================")
     print(f"Input : {input_path}")
     print(f"Output: {output_path}")
-    print(f"Size  : {image.shape[1]}x{image.shape[0]}")
+    print(f"Input size  : {image.shape[1]}x{image.shape[0]}")
+    print(f"Output size : {result.shape[1]}x{result.shape[0]}")
     print()
     print("Blancos -> blanco")
     print("Negros  -> negro")
