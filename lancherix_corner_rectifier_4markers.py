@@ -1,60 +1,90 @@
 """
 lancherix_corner_rectifier_4markers.py
-======================================
+=================================
 
-Localiza los 4 corner markers (TL, TR, BR, BL) de un Lancherix Visual
-Code en una imagen con perspectiva real arbitraria, y construye la
-homografía que rectifica el código a un rectángulo limpio.
+Reescritura desde cero del rectificador de corner markers de Lancherix
+Visual Code, con una lógica mucho más simple que las versiones
+anteriores (lancherix_corner_rectifier.py / _4markers.py).
 
-Con los 4 corners detectados directamente (a diferencia de
-lancherix_corner_rectifier.py, que solo tiene 3 y necesita inferir el
-cuarto con un punto de fuga) el problema se simplifica: cada uno de
-los 4 lados del código (arriba, abajo, izquierda, derecha) puede
-medirse DOS VECES -- una desde cada uno de los dos markers que lo
-tocan -- y esas dos mediciones se combinan en una única recta global
-por mínimos cuadrados. Los cuatro corners finales salen de
-intersectar esas cuatro rectas entre sí. Esto es exacto bajo
-cualquier perspectiva, porque no depende de asumir ningún tamaño o
-simetría del marker: solo depende de encontrar sus lados rectos
-reales.
+La idea (pensada por el autor): en vez de intentar medir los lados
+rectos reales de cada marker con Hough y combinarlos en rectas
+globales, se aprovecha que los 4 centros de los agujeros blancos YA
+se detectan de forma confiable (fase 1, sin cambios), y se construye
+todo lo demás con geometría simple sobre esos 4 puntos.
 
-FASES:
+PIPELINE (6 pasos, uno por cada imagen de debug que el script genera):
 
-    FASE 1 -- CANDIDATOS Y CUADRILÁTERO APROXIMADO
-        Detecta los cuatro centros blancos (agujeros) de los corner
-        markers con un detector robusto (tamaño, forma, elipse,
-        entorno oscuro) y arma el cuadrilátero TL/TR/BR/BL por
-        combinatoria + score geométrico (igual que antes).
+    PASO 1 -- CANDIDATOS Y CUADRILÁTERO (heredado, sin cambios)
+        Detecta los 4 centros blancos (agujeros) de los corner
+        markers y arma el cuadrilátero por combinatoria + score
+        geométrico. Esta parte ya funciona bien y no se toca.
 
-    FASE 2 -- BANDAS INTERNAS (heredada, sin cambios de fondo)
-        Mide la cantidad de negro en cuatro bandas internas de cada
-        marker. Sirve como experimento/verificación de la orientación
-        con la que fue impreso cada marker.
+    PASO 2 -- CUADRILÁTERO DE CENTROS
+        Dibuja las líneas que conectan los 4 centros detectados,
+        formando el cuadrilátero "crudo" (con la perspectiva real de
+        la foto todavía presente).
+        -> {stem}_step2_quad.png
 
-    FASE 3 -- LADOS REALES POR MARKER (Hough) [NUEVO]
-        Por cada uno de los 4 markers, extrae un patch a su alrededor
-        y corre Hough para encontrar sus dos lados rectos exteriores,
-        ya en coordenadas GLOBALES de la imagen (igual que hace
-        lancherix_corner_rectifier.py con sus 3 markers).
+    PASO 3 -- CLASIFICAR LADOS LARGOS/CORTOS Y PONER TODA LA IMAGEN
+              EN PERSPECTIVA
+        Mide los 4 lados del cuadrilátero. Los dos lados más largos
+        (en promedio) se consideran "arriba/abajo" y los dos más
+        cortos "izquierda/derecha" -- esto es lo que permite
+        reconocer el código aunque esté fotografiado de lado (rotado
+        90°), porque el marcador es siempre más ancho que alto por
+        diseño (relación 3:1 del código completo).
+        Con esa clasificación se calcula una homografía que lleva los
+        4 centros a un rectángulo (con las proporciones REALMENTE
+        medidas, no forzadas a 3:1 -- forzar 3:1 acá introduciría
+        error para valores de k chicos, donde el rectángulo de
+        centros todavía no se aproxima tanto a 3:1) y esa homografía
+        se aplica a TODA la imagen, no solo al rectángulo: el destino
+        incluye un margen alrededor para no perder el contexto ni el
+        borde real del código, que todavía está más afuera que los
+        centros de los markers.
+        -> {stem}_step3a_clasificacion.png (qué lado se consideró largo/corto)
+        -> {stem}_step3b_warped.png (imagen completa ya en perspectiva)
 
-    FASE 4 -- CUADRILÁTERO EXACTO POR INTERSECCIÓN [NUEVO]
-        Combina las dos mediciones de cada lado del código
-        (superior: TL+TR, inferior: BR+BL, izquierdo: TL+BL, derecho:
-        TR+BR) en una única recta robusta (ajuste por mínimos
-        cuadrados), e intersecta esas 4 rectas para obtener los 4
-        corners EXACTOS del código -- ya no estimados a partir de un
-        tamaño de marker asumido, como hacía la versión anterior de
-        este archivo.
+    PASO 4 -- RECTÁNGULO REAL DEL CÓDIGO
+        Ya con la imagen sin perspectiva, el rectángulo de centros de
+        markers quedó perfectamente axis-aligned. Se dibuja un segundo
+        rectángulo, más grande, paralelo, y a la misma distancia hacia
+        afuera en los 4 lados: esa distancia es el radio de un
+        glifo/módulo (mitad de su ancho, mitad de su alto), estimado
+        proyectando el tamaño de marker ya conocido (fase 1) a través
+        de la misma homografía del paso 3.
+        -> {stem}_step4_borders.png
 
-    FASE 5 -- RECTIFICACIÓN
-        Homografía de los 4 corners exactos a un rectángulo, y
-        warpPerspective. Si la fase 3/4 no logra detectar líneas
-        suficientes (imagen muy borrosa o de baja resolución), se cae
-        de vuelta al método anterior, más simple, que estima el borde
-        exterior a partir del tamaño del agujero blanco.
+    PASO 5 -- CUADRÍCULA Y RECORTE DEFINITIVO
+        Se dibuja la cuadrícula de módulos dentro del rectángulo
+        exterior (a partir del tamaño de módulo estimado en el paso
+        4) y se recorta la imagen a ese rectángulo exterior, dejando
+        solo el código.
+        -> {stem}_step5_grid_debug.png (con cuadrícula, para inspección)
+        -> {stem}_step5_cropped.png (recorte limpio, sin dibujar nada)
+
+    PASO 6 -- CORRECCIÓN FINAL DE ORIENTACIÓN (180°)
+        Los pasos 3-5 ya resuelven la ambigüedad de 90°/270° (código
+        de lado), pero queda una ambigüedad de 180° posible (código
+        boca abajo pero ya "horizontal"). Se mide la orientación
+        impresa real del marker que quedó en la esquina superior
+        izquierda geométrica (banda con más negro, igual que la fase
+        2 de las versiones anteriores) y se compara contra la
+        orientación esperada de TL en el diseño (0°, ver
+        lancherix_shapes.EXPECTED... / CORNER_MARKER_GLYPHS[0]):
+            - si se mide ~0°  -> ya está correcta, no se hace nada.
+            - si se mide ~180° -> el código está boca abajo, se rota
+              la imagen 180°.
+            - cualquier otro valor (90°/270°) indica que la
+              clasificación del paso 3 falló; se avisa por consola y
+              NO se aplica ninguna rotación automática (rotar 90° acá
+              rompería el recorte ya hecho, que asume la proporción
+              3:1 correcta).
+        -> {stem}_step6_final.png (esta es la imagen que se le pasaría
+           al reader)
 
 Uso standalone (debug):
-    python3 lancherix_corner_rectifier_4markers.py imagen.png
+    python3 lancherix_corner_rectifier_v3.py imagen.png
 """
 
 from __future__ import annotations
@@ -72,7 +102,7 @@ import numpy as np
 # CONFIGURACIÓN
 # ============================================================================
 
-# --- Fase 1: detección de agujeros blancos -----------------------------
+# --- Paso 1: detección de agujeros blancos (heredado, sin cambios) --------
 
 MIN_COMPONENT_AREA = 20
 MAX_COMPONENT_AREA_FRACTION = 0.01  # fracción del área total de la imagen
@@ -83,62 +113,47 @@ MAX_SIZE = 100
 MIN_CIRCULARITY = 0.20
 MAX_ELLIPSE_ASPECT = 4.5
 
-# --- Fase 1: cuadrilátero -------------------------------------------------
-
 OPPOSITE_SIDE_TOLERANCE = 0.45
 DIAGONAL_RATIO_MIN = 0.35
-
-# --- Geometría del marker --------------------------------------------------
 
 # El agujero blanco central mide esta fracción del marker completo
 # (ver lancherix_shapes.render_glyph). marker_size = hole_size / RATIO.
 HOLE_TO_MARKER_RATIO = 0.24
 
-# --- Fase 2: bandas internas ------------------------------------------------
+# --- Paso 3: margen alrededor del rectángulo de centros, al poner toda
+#     la imagen en perspectiva. En unidades de "módulo" (tamaño de
+#     marker estimado en la imagen ORIGINAL). Generoso a propósito:
+#     solo tiene que alcanzar para cubrir el borde real del código
+#     (paso 4) más algo de contexto; si sobra, se recorta en el paso 5.
+MARGIN_MODULES = 3.0
 
+# --- Paso 6: bandas internas para medir la orientación impresa de un
+#     marker (heredado de la fase 2 de las versiones anteriores).
 BAND_MARGIN = 0.05
 BAND_END = 0.45
 DARK_THRESHOLD = 100
 
-# --- Fase 3: extracción de líneas (Hough) -----------------------------------
-
-PATCH_PADDING = 0.35
-
-HOUGH_THRESHOLD = 25
-HOUGH_MIN_LINE_LENGTH = 10
-HOUGH_MAX_LINE_GAP = 6
-
-# --- Debug -------------------------------------------------------------
-
-DEBUG_RADIUS = 18
-
-# El código completo (código + los 3k-1 x (k-1) módulos) siempre tiene
-# una proporción ancho:alto de 3:1 (ver lancherix_shapes). Esto es un
-# invariante del generador, no algo que se deba medir en la imagen.
-OUTPUT_ASPECT_RATIO = 3.0
-
-EPS = 1e-9
-
-# --- Fase 5b: corrección de orientación (rotación / espejo) ----------------
-
-# Orientación IMPRESA esperada (grados) de cada esquina, según el diseño
-# del generador (ver lancherix_shapes.py, asignación esquina->orientación).
+# Orientación IMPRESA esperada (grados) de cada esquina, según el
+# diseño del generador (ver lancherix_shapes.py). Solo TL se usa acá,
+# pero se deja el dict completo por claridad / uso futuro.
 EXPECTED_PRINTED_ORIENTATION = {
     "TL": 0,
     "TR": 90,
-    "BR": 0,
-    "BL": 90,
+    "BR": 270,
+    "BL": 0,
 }
+
+EPS = 1e-9
+
+OPPOSITE_LABEL = {"TL": "BR", "TR": "BL", "BR": "TL", "BL": "TR"}
+
 
 # ============================================================================
 # UTILIDADES GEOMÉTRICAS BÁSICAS
 # ============================================================================
 
 def distance(a, b):
-    return math.hypot(
-        float(a[0]) - float(b[0]),
-        float(a[1]) - float(b[1]),
-    )
+    return math.hypot(float(a[0]) - float(b[0]), float(a[1]) - float(b[1]))
 
 
 def polygon_area(points):
@@ -162,99 +177,15 @@ def angle_between(a, b, c):
     return math.degrees(math.acos(cos_value))
 
 
-# ----- rectas (representadas como ax + by + c = 0, con (a,b) unitario) -----
-
-def cross(a, b):
-    return np.cross(a, b)
-
-
-def line_from_points(p1, p2):
-    p1h = np.asarray([p1[0], p1[1], 1.0], dtype=np.float64)
-    p2h = np.asarray([p2[0], p2[1], 1.0], dtype=np.float64)
-
-    l = cross(p1h, p2h)
-    n = math.hypot(l[0], l[1])
-    if n < EPS:
-        return None
-    return l / n
-
-
-def line_angle(line):
-    a, b, _ = line
-    angle = math.degrees(math.atan2(-a, b))
-    angle %= 180.0
-    return angle
-
-
-def angle_difference(a, b):
-    d = abs(a - b) % 180.0
-    if d > 90.0:
-        d = 180.0 - d
-    return d
-
-
-def intersect_lines(l1, l2):
-    if l1 is None or l2 is None:
-        return None
-    p = cross(l1, l2)
-    if abs(p[2]) < EPS:
-        return None
-    return np.array([p[0] / p[2], p[1] / p[2]], dtype=np.float64)
-
-
-def fit_global_line(items):
-    """
-    Ajusta una única recta (por mínimos cuadrados) a través de los
-    puntos extremos de una o más mediciones (items con "p1"/"p2" en
-    coordenadas GLOBALES). Se usa para combinar, por ejemplo, la
-    medición del lado superior hecha desde TL con la medición del
-    mismo lado superior hecha desde TR.
-    """
-    points = []
-    for item in items:
-        points.append(item["p1"])
-        points.append(item["p2"])
-
-    if len(points) < 2:
-        return None
-
-    pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
-
-    vx, vy, x0, y0 = cv2.fitLine(
-        pts,
-        cv2.DIST_L2,
-        0,
-        0.01,
-        0.01,
-    ).flatten()
-
-    a, b = float(vy), float(-vx)
-    norm = math.hypot(a, b)
-    if norm < EPS:
-        return None
-
-    a, b = a / norm, b / norm
-    c = -(a * x0 + b * y0)
-
-    return np.array([a, b, c], dtype=np.float64)
-
-
 # ============================================================================
-# FASE 1 — DETECCIÓN ROBUSTA DE AGUJEROS BLANCOS
+# PASO 1 — DETECCIÓN ROBUSTA DE AGUJEROS BLANCOS (heredado, sin cambios)
 # ============================================================================
 
 def detect_white_center_candidates(image):
     """
-    Detecta los centros blancos de los corner markers.
-
-    El centro real de cada marker es un pequeño agujero blanco dentro
-    de una forma negra. Bajo perspectiva puede convertirse en una
-    elipse, así que la circularidad no se usa como requisito
-    estricto: se combina tamaño del componente, aspect ratio,
-    circularidad, ajuste de elipse, entorno predominantemente oscuro
-    y penalización de regiones blancas demasiado grandes, para no
-    confundir zonas blancas grandes del contenido del código con
-    centros de marker.
+    Detecta los centros blancos de los corner markers. Sin cambios
+    respecto a las versiones anteriores -- esta parte ya funciona
+    bien.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -395,10 +326,6 @@ def detect_white_center_candidates(image):
     return candidates
 
 
-# ============================================================================
-# ORDENAMIENTO Y SCORE DEL CUADRILÁTERO (candidatos -> TL/TR/BR/BL)
-# ============================================================================
-
 def order_quad(points):
     pts = np.asarray(points, dtype=np.float32)
 
@@ -496,15 +423,15 @@ def find_best_quad(candidates):
 
 def build_marker_results(best_quad):
     """
-    Asigna a cada uno de los 4 puntos ordenados (TL, TR, BR, BL) el
-    candidato original más cercano, y devuelve una lista de
-    diccionarios "marker" con una clave "label" añadida.
+    Nota: las etiquetas TL/TR/BR/BL que asigna esta función son
+    puramente GEOMÉTRICAS (qué candidato quedó en qué posición de la
+    foto), no necesariamente corresponden todavía a la semántica real
+    del diseño (eso se resuelve recién en el paso 6).
     """
     if best_quad is None:
         return None
 
     labels = ["TL", "TR", "BR", "BL"]
-
     marker_results = []
 
     for label, point in zip(labels, best_quad["points"]):
@@ -519,693 +446,241 @@ def build_marker_results(best_quad):
 
 def estimate_marker_size(candidate):
     """
-    Tamaño estimado del marker completo, a partir del tamaño del
-    agujero blanco central y de la proporción conocida del generador.
+    Tamaño estimado del marker completo (= un módulo), a partir del
+    tamaño del agujero blanco central y la proporción conocida del
+    generador.
     """
     hole_diameter = (candidate["w"] + candidate["h"]) / 2.0
     return hole_diameter / HOLE_TO_MARKER_RATIO
 
 
 # ============================================================================
-# FASE 2 — BANDAS INTERNAS (heredada)
+# PASO 2 — CUADRILÁTERO DE CENTROS (debug)
 # ============================================================================
 
-def analyze_marker_inner_zones(image, candidate):
-    """
-    Divide el marker en cuatro BANDAS completas (arriba/abajo cubren
-    todo el ancho, izquierda/derecha cubren todo el alto) y mide la
-    fracción de píxeles oscuros en cada una. Sirve para verificar con
-    qué orientación fue impreso cada marker.
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+def draw_quad_debug(image, marker_results):
+    debug = image.copy()
+    lookup = {m["label"]: m for m in marker_results}
+    labels = ("TL", "TR", "BR", "BL")
+    points = [lookup[label]["center"] for label in labels]
 
-    cx, cy = candidate["center"]
-    marker_size = estimate_marker_size(candidate)
-    half = marker_size / 2.0
+    pts_int = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+    cv2.polylines(debug, [pts_int], True, (0, 255, 0), 3, cv2.LINE_AA)
 
-    outer = half * BAND_MARGIN
-    inner = half * BAND_END
-
-    def measure_region(x0, y0, x1, y1):
-        x0 = max(0, int(math.floor(x0)))
-        y0 = max(0, int(math.floor(y0)))
-        x1 = min(gray.shape[1], int(math.ceil(x1)))
-        y1 = min(gray.shape[0], int(math.ceil(y1)))
-
-        if x1 <= x0 or y1 <= y0:
-            return 0.0
-
-        region = gray[y0:y1, x0:x1]
-        if region.size == 0:
-            return 0.0
-
-        dark_pixels = np.count_nonzero(region < DARK_THRESHOLD)
-        return float(dark_pixels / region.size)
-
-    left = measure_region(
-        cx - half + outer, cy - half + outer,
-        cx - half + inner, cy + half - outer,
-    )
-    right = measure_region(
-        cx + half - inner, cy - half + outer,
-        cx + half - outer, cy + half - outer,
-    )
-    top = measure_region(
-        cx - half + outer, cy - half + outer,
-        cx + half - outer, cy - half + inner,
-    )
-    bottom = measure_region(
-        cx - half + outer, cy + half - inner,
-        cx + half - outer, cy + half - outer,
-    )
-
-    return {"left": left, "top": top, "right": right, "bottom": bottom}
-
-
-def analyze_four_markers(image, marker_results):
-    """
-    Mide las cuatro bandas de cada marker y deduce, con qué
-    orientación fue impreso (0/90/180/270), a partir de cuál banda
-    concentra más negro.
-
-        máximo derecha  -> marker 0°
-        máximo abajo    -> marker 90°
-        máximo izquierda -> marker 180°
-        máximo arriba   -> marker 270°
-    """
-    if not marker_results:
-        return None
-
-    orientation_map = {"right": 0, "bottom": 90, "left": 180, "top": 270}
-
-    results = {}
-
-    for marker in marker_results:
-        measurements = analyze_marker_inner_zones(image, marker)
-        max_side = max(measurements, key=measurements.get)
-        printed_orientation = orientation_map[max_side]
-
-        results[marker["label"]] = {
-            **measurements,
-            "max_side": max_side,
-            "printed_orientation": printed_orientation,
-        }
-
-    return results
-
-
-# ============================================================================
-# FASE 3 — LADOS RECTOS REALES DE CADA MARKER (Hough)
-# ============================================================================
-
-def extract_marker_patch(image, candidate):
-    """
-    Extrae un patch alrededor del corner marker completo, a partir
-    del agujero blanco detectado (diámetro del agujero =
-    HOLE_TO_MARKER_RATIO * tamaño del marker completo).
-    """
-    h, w = image.shape[:2]
-    cx, cy = candidate["center"]
-
-    marker_size = estimate_marker_size(candidate)
-    pad = marker_size * PATCH_PADDING
-    half_size = marker_size / 2.0 + pad
-
-    x0 = max(0, int(round(cx - half_size)))
-    y0 = max(0, int(round(cy - half_size)))
-    x1 = min(w, int(round(cx + half_size)))
-    y1 = min(h, int(round(cy + half_size)))
-
-    return image[y0:y1, x0:x1], (x0, y0)
-
-
-def extract_lines_from_patch(patch):
-    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blur, 40, 120)
-
-    lines = cv2.HoughLinesP(
-        edges, rho=1, theta=np.pi / 180.0,
-        threshold=HOUGH_THRESHOLD,
-        minLineLength=HOUGH_MIN_LINE_LENGTH,
-        maxLineGap=HOUGH_MAX_LINE_GAP,
-    )
-
-    result = []
-    if lines is None:
-        return result
-
-    for item in lines:
-        x1, y1, x2, y2 = map(float, item[0]) if item.ndim == 2 else map(float, item)
-        length = math.hypot(x2 - x1, y2 - y1)
-        if length < HOUGH_MIN_LINE_LENGTH:
-            continue
-
-        line = line_from_points((x1, y1), (x2, y2))
-        if line is None:
-            continue
-
-        result.append({
-            "p1": np.array([x1, y1]), "p2": np.array([x2, y2]),
-            "line": line, "angle": line_angle(line), "length": length,
-        })
-
-    return result
-
-
-def transform_line_to_global(local_line, offset):
-    a, b, c = local_line
-    ox, oy = offset
-
-    result = np.array([a, b, c - a * ox - b * oy], dtype=np.float64)
-    n = math.hypot(result[0], result[1])
-    if n < EPS:
-        return result
-    return result / n
-
-
-def choose_marker_side_lines(candidate, image, vertical_side, horizontal_side):
-    """
-    Detecta los dos lados exteriores rectos de un corner marker, ya
-    en coordenadas GLOBALES:
-
-        vertical_side:   "left" o "right"
-        horizontal_side: "top" o "bottom"
-
-    Por ejemplo TL usa ("left", "top"), BR usa ("right", "bottom").
-
-    A diferencia de la primera versión, esto NO hace una votación
-    "a ciegas" sobre todas las líneas del patch (lo cual, en un
-    código con contenido denso pegado al marker, terminaba eligiendo
-    bordes de las figuras del contenido en vez del propio borde del
-    marker). En cambio, usa como prior la posición donde SABEMOS que
-    debería estar ese lado -- a partir del tamaño estimado del marker
-    (candidate["center"] +/- half, ver estimate_marker_size) -- y solo
-    acepta líneas de Hough que caigan cerca de esa posición esperada
-    y que además sean razonablemente rectas en la dirección correcta
-    (bien horizontales para el lado de arriba/abajo, bien verticales
-    para el de izquierda/derecha). Se devuelve la LISTA completa de
-    coincidencias (no solo la "mejor"), porque el borde real suele
-    aparecer partido en varios segmentos de Hough (interrumpidos por
-    el agujero blanco o por el contenido); esa lista completa se
-    ajusta luego por mínimos cuadrados en fit_global_line().
-    """
-    patch, offset = extract_marker_patch(image, candidate)
-    if patch is None or patch.size == 0:
-        return None
-
-    local_lines = extract_lines_from_patch(patch)
-    if not local_lines:
-        return None
-
-    offset_vec = np.asarray(offset, dtype=np.float64)
-
-    lines = []
-    for item in local_lines:
-        global_line = transform_line_to_global(item["line"], offset)
-        lines.append({
-            **item,
-            "line": global_line,
-            "p1": item["p1"] + offset_vec,
-            "p2": item["p2"] + offset_vec,
-        })
-
-    cx, cy = candidate["center"]
-    half = estimate_marker_size(candidate) / 2.0
-
-    expected_y = (cy - half) if horizontal_side == "top" else (cy + half)
-    expected_x = (cx - half) if vertical_side == "left" else (cx + half)
-
-    def find_matches(steepness_ratio, position_of, expected_position, tolerance):
-        matches = []
-        for item in lines:
-            dx = abs(item["p2"][0] - item["p1"][0])
-            dy = abs(item["p2"][1] - item["p1"][1])
-
-            if position_of == "y":
-                # Buscamos líneas casi HORIZONTALES: dx debe dominar sobre dy.
-                if dx < steepness_ratio * dy:
-                    continue
-                position = (item["p1"][1] + item["p2"][1]) / 2.0
-            else:
-                # Buscamos líneas casi VERTICALES: dy debe dominar sobre dx.
-                if dy < steepness_ratio * dx:
-                    continue
-                position = (item["p1"][0] + item["p2"][0]) / 2.0
-
-            if abs(position - expected_position) <= tolerance:
-                matches.append(item)
-
-        return matches
-
-    base_tolerance = max(half * 0.5, 6.0)
-
-    horizontal_matches = find_matches(2.0, "y", expected_y, base_tolerance)
-    if not horizontal_matches:
-        # Segundo intento, más permisivo, por si la perspectiva o el
-        # ruido corrieron el borde un poco más de lo esperado.
-        horizontal_matches = find_matches(1.5, "y", expected_y, base_tolerance * 2.5)
-
-    vertical_matches = find_matches(2.0, "x", expected_x, base_tolerance)
-    if not vertical_matches:
-        vertical_matches = find_matches(1.5, "x", expected_x, base_tolerance * 2.5)
-
-    return {
-        "horizontal": horizontal_matches or None,
-        "vertical": vertical_matches or None,
-    }
-
-
-# ============================================================================
-# FASE 4 — CUADRILÁTERO EXACTO POR INTERSECCIÓN DE LOS 4 LADOS
-# ============================================================================
-
-# Qué lado vertical/horizontal le corresponde a cada esquina.
-CORNER_SIDES = {
-    "TL": ("left", "top"),
-    "TR": ("right", "top"),
-    "BR": ("right", "bottom"),
-    "BL": ("left", "bottom"),
-}
-
-# Qué dos markers contribuyen a cada uno de los 4 lados del código.
-EDGE_CONTRIBUTORS = {
-    "top": (("TL", "horizontal"), ("TR", "horizontal")),
-    "bottom": (("BR", "horizontal"), ("BL", "horizontal")),
-    "left": (("TL", "vertical"), ("BL", "vertical")),
-    "right": (("TR", "vertical"), ("BR", "vertical")),
-}
-
-
-def detect_marker_geometries(image, marker_results):
-    """
-    Corre choose_marker_side_lines() para cada uno de los 4 markers.
-    Devuelve un dict {label: geometry|None}.
-    """
-    marker_geoms = {}
-
-    for marker in marker_results:
-        label = marker["label"]
-        vertical_side, horizontal_side = CORNER_SIDES[label]
-        marker_geoms[label] = choose_marker_side_lines(
-            marker, image, vertical_side, horizontal_side,
+    for label, point in zip(labels, points):
+        x, y = int(round(point[0])), int(round(point[1]))
+        cv2.circle(debug, (x, y), 10, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            debug, label, (x + 14, y - 14),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA,
         )
 
-    return marker_geoms
-
-
-def build_precise_quad(marker_geoms):
-    """
-    Combina, para cada uno de los 4 lados del código, las mediciones
-    de los dos markers que lo tocan en una única recta (mínimos
-    cuadrados), e intersecta esas 4 rectas para obtener los 4 corners
-    exactos.
-
-    Devuelve None si no hay evidencia suficiente para alguno de los
-    4 lados o alguno de los 4 corners.
-    """
-    edge_lines = {}
-
-    for edge_name, contributors in EDGE_CONTRIBUTORS.items():
-        items = []
-        for label, key in contributors:
-            geometry = marker_geoms.get(label)
-            if geometry and geometry.get(key):
-                items.extend(geometry[key])
-
-        edge_lines[edge_name] = fit_global_line(items) if items else None
-
-    if any(edge_lines[name] is None for name in ("top", "bottom", "left", "right")):
-        return None
-
-    corners = {
-        "TL": intersect_lines(edge_lines["top"], edge_lines["left"]),
-        "TR": intersect_lines(edge_lines["top"], edge_lines["right"]),
-        "BR": intersect_lines(edge_lines["bottom"], edge_lines["right"]),
-        "BL": intersect_lines(edge_lines["bottom"], edge_lines["left"]),
-    }
-
-    if any(point is None for point in corners.values()):
-        return None
-
-    return {"corners": corners, "edges": edge_lines}
+    return debug
 
 
 # ============================================================================
-# FASE 5 — RECTIFICACIÓN
+# PASO 3 — LARGO/CORTO Y PERSPECTIVA DE TODA LA IMAGEN
 # ============================================================================
 
-def rectify_from_corners(image, corners):
+def measure_rectangle_dimensions(marker_results):
     """
-    Rectifica la imagen dado un dict {"TL":.., "TR":.., "BR":.., "BL":..}
-    de puntos en coordenadas de imagen.
-
-    IMPORTANTE: el ancho y el alto de salida NO se calculan por
-    separado a partir de las distancias top/bottom (para el ancho) y
-    left/right (para el alto) del cuadrilátero proyectado. Bajo
-    perspectiva esas distancias están foreshortened de forma
-    DISTINTA entre sí (por ejemplo el lado más cercano a la cámara
-    se ve más largo que el lado más lejano), así que tomar el máximo
-    de cada par por separado no reconstruye la proporción real del
-    código -- eso fue lo que causaba la escala incorrecta.
-
-    En cambio, la proporción ancho:alto del código es un invariante
-    conocido del generador (OUTPUT_ASPECT_RATIO = 3:1), así que se fija
-    directamente: solo se estima una resolución de salida razonable
-    (a partir del alto aparente izquierdo/derecho) y el ancho sale de
-    multiplicar por 3. La homografía ya se encarga de corregir toda la
-    distorsión de perspectiva independientemente de esa elección de
-    resolución.
-    """
-    tl = np.asarray(corners["TL"], dtype=np.float32)
-    tr = np.asarray(corners["TR"], dtype=np.float32)
-    br = np.asarray(corners["BR"], dtype=np.float32)
-    bl = np.asarray(corners["BL"], dtype=np.float32)
-
-    left_height = distance(tl, bl)
-    right_height = distance(tr, br)
-
-    height = int(round(max(left_height, right_height)))
-    width = int(round(height * OUTPUT_ASPECT_RATIO))
-
-    if width < 10 or height < 10:
-        return None, None
-
-    source_points = np.array([tl, tr, br, bl], dtype=np.float32)
-    destination_points = np.array(
-        [(0, 0), (width - 1, 0), (width - 1, height - 1), (0, height - 1)],
-        dtype=np.float32,
-    )
-
-    matrix = cv2.getPerspectiveTransform(source_points, destination_points)
-    rectified = cv2.warpPerspective(
-        image, matrix, (width, height), flags=cv2.INTER_LINEAR,
-    )
-
-    return rectified, matrix
-
-
-def estimate_outer_corners_fallback(marker_results):
-    """
-    Método anterior (aproximado): a partir de los 4 centros
-    detectados y del tamaño estimado de cada marker (asumiendo que el
-    marker es simétrico alrededor de su agujero), se desplaza cada
-    centro hacia afuera a lo largo de los lados del cuadrilátero.
-
-    Se usa solo como fallback cuando la fase 3/4 (líneas reales de
-    Hough) no logra reunir evidencia suficiente -- por ejemplo en
-    imágenes muy borrosas o de muy baja resolución -- porque, a
-    diferencia de la intersección de lados reales, este método
-    asume un tamaño de marker uniforme y por lo tanto es menos
-    preciso bajo perspectiva fuerte.
+    Ancho y alto del rectángulo de centros, promediando las dos
+    mediciones de cada dimensión (arriba/abajo para el ancho,
+    izquierda/derecha para el alto).
     """
     lookup = {m["label"]: m for m in marker_results}
-    if not all(label in lookup for label in ("TL", "TR", "BR", "BL")):
-        return None
 
-    tl_c = np.asarray(lookup["TL"]["center"], dtype=np.float64)
-    tr_c = np.asarray(lookup["TR"]["center"], dtype=np.float64)
-    br_c = np.asarray(lookup["BR"]["center"], dtype=np.float64)
-    bl_c = np.asarray(lookup["BL"]["center"], dtype=np.float64)
+    top = distance(lookup["TL"]["center"], lookup["TR"]["center"])
+    bottom = distance(lookup["BL"]["center"], lookup["BR"]["center"])
+    left = distance(lookup["TL"]["center"], lookup["BL"]["center"])
+    right = distance(lookup["TR"]["center"], lookup["BR"]["center"])
 
-    marker_sizes = {
-        label: estimate_marker_size(lookup[label])
-        for label in ("TL", "TR", "BR", "BL")
-    }
+    width = (top + bottom) / 2.0
+    height = (left + right) / 2.0
 
-    top_vector = tr_c - tl_c
-    bottom_vector = br_c - bl_c
-    left_vector = bl_c - tl_c
-    right_vector = br_c - tr_c
+    return width, height
 
-    lengths = [
-        np.linalg.norm(top_vector), np.linalg.norm(bottom_vector),
-        np.linalg.norm(left_vector), np.linalg.norm(right_vector),
+
+def reorder_markers_by_long_short(marker_results):
+    """
+    Reclasifica cuál par de lados opuestos es "largo" (arriba/abajo)
+    y cuál es "corto" (izquierda/derecha), sin asumir que el
+    etiquetado geométrico de la fase 1 ya los puso del lado correcto
+    -- el código puede estar fotografiado de lado (rotado 90°).
+
+    Si los lados verticales (izquierda/derecha) resultan ser, en
+    promedio, más largos que los horizontales, se rota la asignación
+    de etiquetas UN lugar en el ciclo TL->TR->BR->BL->TL, lo que
+    intercambia cuál par se llama "arriba/abajo" y cuál
+    "izquierda/derecha", sin tocar el orden geométrico real de los
+    puntos (siguen siendo las 4 esquinas del mismo cuadrilátero).
+
+    Devuelve (marker_results_reordenado, rotated: bool).
+    """
+    lookup = {m["label"]: m for m in marker_results}
+    ordered = [lookup["TL"], lookup["TR"], lookup["BR"], lookup["BL"]]
+
+    top = distance(ordered[0]["center"], ordered[1]["center"])
+    right = distance(ordered[1]["center"], ordered[2]["center"])
+    bottom = distance(ordered[2]["center"], ordered[3]["center"])
+    left = distance(ordered[3]["center"], ordered[0]["center"])
+
+    horizontal_avg = (top + bottom) / 2.0
+    vertical_avg = (left + right) / 2.0
+
+    rotated = vertical_avg > horizontal_avg
+    if rotated:
+        ordered = ordered[1:] + ordered[:1]
+
+    labels = ("TL", "TR", "BR", "BL")
+    new_marker_results = [
+        {**candidate, "label": label} for label, candidate in zip(labels, ordered)
     ]
-    if min(lengths) < EPS:
-        return None
-
-    top_unit = top_vector / lengths[0]
-    bottom_unit = bottom_vector / lengths[1]
-    left_unit = left_vector / lengths[2]
-    right_unit = right_vector / lengths[3]
-
-    tl_r = marker_sizes["TL"] / 2.0
-    tr_r = marker_sizes["TR"] / 2.0
-    br_r = marker_sizes["BR"] / 2.0
-    bl_r = marker_sizes["BL"] / 2.0
-
-    tl_outer = tl_c - top_unit * tl_r - left_unit * tl_r
-    tr_outer = tr_c + top_unit * tr_r - right_unit * tr_r
-    br_outer = br_c + bottom_unit * br_r + right_unit * br_r
-    bl_outer = bl_c - bottom_unit * bl_r + left_unit * bl_r
-
-    return {
-        "TL": tuple(tl_outer), "TR": tuple(tr_outer),
-        "BR": tuple(br_outer), "BL": tuple(bl_outer),
-    }
+    return new_marker_results, rotated
 
 
-# ============================================================================
-# FASE 5b — CORRECCIÓN DE ORIENTACIÓN (rotación 90/180/270° y espejo)
-# ============================================================================
-#
-# La fase 2 mide la orientación IMPRESA real de cada marker. Esta fase
-# compara esa medición contra la orientación ESPERADA de cada esquina
-# (EXPECTED_PRINTED_ORIENTATION) para deducir si la imagen ya
-# rectificada (fase 5) quedó rotada y/o espejada respecto a como fue
-# generada, y la corrige.
-
-def _closest_multiple_of_90(degrees):
-    return int(round(degrees / 90.0) * 90) % 360
-
-
-def _rotation_offset(measured, expected):
-    return _closest_multiple_of_90((measured - expected) % 360)
-
-
-# Cómo se permutan las etiquetas de esquina (posición geométrica) al
-# aplicar cada transformación sobre la imagen rectificada.
-_MIRROR_LABEL_MAP = {"TL": "TR", "TR": "TL", "BL": "BR", "BR": "BL"}
-
-_ROTATE_LABEL_MAPS = {
-    0:   {"TL": "TL", "TR": "TR", "BR": "BR", "BL": "BL"},
-    90:  {"TL": "TR", "TR": "BR", "BR": "BL", "BL": "TL"},
-    180: {"TL": "BR", "TR": "BL", "BR": "TL", "BL": "TR"},
-    270: {"TL": "BL", "TR": "TL", "BR": "TR", "BL": "BR"},
-}
-
-
-def detect_orientation_correction(phase2_results):
+def draw_side_classification_debug(image, marker_results, rotated):
     """
-    Devuelve un dict describiendo la corrección a aplicar sobre la
-    imagen ya rectificada:
-
-        {
-            "kind": "none" | "rotation" | "mirror_rotation" | "unknown",
-            "rotation": 0 | 90 | 180 | 270,  # rotación horaria a aplicar
-            "mirror": bool,                   # flip horizontal, ANTES de rotar
-            "detail": str,
-        }
-
-    "unknown" = fase 2 incompleta, o las 4 mediciones no son
-    consistentes con ninguna rotación/espejo puro. En ese caso no se
-    aplica ninguna corrección.
+    Muestra, sobre la imagen original, cuáles lados del cuadrilátero
+    de centros se clasificaron como largos (rojo, van a ser
+    arriba/abajo) y cuáles como cortos (azul, van a ser
+    izquierda/derecha).
     """
-    labels = ("TL", "TR", "BR", "BL")
+    debug = image.copy()
+    lookup = {m["label"]: m for m in marker_results}
+    tl, tr, br, bl = (lookup[l]["center"] for l in ("TL", "TR", "BR", "BL"))
 
-    if not phase2_results or not all(label in phase2_results for label in labels):
-        return {
-            "kind": "unknown", "rotation": 0, "mirror": False,
-            "detail": "Fase 2 incompleta: no hay medición en las 4 esquinas.",
-        }
+    def to_int(p):
+        return (int(round(p[0])), int(round(p[1])))
 
-    measured = {
-        label: phase2_results[label]["printed_orientation"] for label in labels
-    }
+    long_color = (0, 0, 255)   # rojo = lado largo -> arriba/abajo
+    short_color = (255, 0, 0)  # azul = lado corto -> izquierda/derecha
 
-    # --- Caso 1: rotación pura (sin espejo) ---------------------------------
-    offsets = {
-        label: _rotation_offset(measured[label], EXPECTED_PRINTED_ORIENTATION[label])
-        for label in labels
-    }
+    cv2.line(debug, to_int(tl), to_int(tr), long_color, 4, cv2.LINE_AA)
+    cv2.line(debug, to_int(bl), to_int(br), long_color, 4, cv2.LINE_AA)
+    cv2.line(debug, to_int(tl), to_int(bl), short_color, 4, cv2.LINE_AA)
+    cv2.line(debug, to_int(tr), to_int(br), short_color, 4, cv2.LINE_AA)
 
-    if len(set(offsets.values())) == 1:
-        rotation = next(iter(offsets.values()))
-        return {
-            "kind": "rotation" if rotation != 0 else "none",
-            "rotation": rotation,
-            "mirror": False,
-            "detail": (
-                f"Rotacion pura detectada: {rotation}. "
-                f"medido={measured} esperado={EXPECTED_PRINTED_ORIENTATION}"
-            ),
-        }
+    for label, point in zip(("TL", "TR", "BR", "BL"), (tl, tr, br, bl)):
+        x, y = to_int(point)
+        cv2.circle(debug, (x, y), 9, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.putText(
+            debug, label, (x + 12, y - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2, cv2.LINE_AA,
+        )
 
-    # --- Caso 2: espejado (+ posible rotación) ------------------------------
-    # Un flip horizontal invierte izquierda/derecha (TL<->TR, BL<->BR) y
-    # además invierte el sentido en que se lee el ángulo impreso de cada
-    # marker (una forma dibujada a A° se ve, espejada, a (360-A)%360).
-    mirrored_measured = {
-        "TL": (180 - measured["TR"]) % 360,
-        "TR": (180 - measured["TL"]) % 360,
-        "BL": (180 - measured["BR"]) % 360,
-        "BR": (180 - measured["BL"]) % 360,
-    }
+    note = "codigo rotado 90 (detectado)" if rotated else "sin rotacion de 90 necesaria"
+    cv2.putText(
+        debug, note, (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA,
+    )
 
-    mirror_offsets = {
-        label: _rotation_offset(mirrored_measured[label], EXPECTED_PRINTED_ORIENTATION[label])
-        for label in labels
-    }
-
-    if len(set(mirror_offsets.values())) == 1:
-        rotation = next(iter(mirror_offsets.values()))
-        return {
-            "kind": "mirror_rotation",
-            "rotation": rotation,
-            "mirror": True,
-            "detail": f"Espejo detectado (+ rotacion {rotation}). medido={measured}",
-        }
-
-    # --- Caso 3: no hay patrón consistente -----------------------------------
-    return {
-        "kind": "unknown",
-        "rotation": 0,
-        "mirror": False,
-        "detail": (
-            f"Sin correccion consistente. medido={measured} "
-            f"offsets={offsets} mirror_offsets={mirror_offsets}"
-        ),
-    }
+    return debug
 
 
-def _label_permutation(correction):
+def compute_whole_image_warp(image, marker_results, margin_modules=MARGIN_MODULES):
     """
-    Combina el mapa de espejo y el de rotación en {label_original:
-    label_final}, en el mismo orden en que se aplican las
-    transformaciones sobre la imagen (mirror primero, rotate después).
-    """
-    rotate_map = _ROTATE_LABEL_MAPS[correction["rotation"]]
-
-    if correction["mirror"]:
-        return {
-            label: rotate_map[_MIRROR_LABEL_MAP[label]]
-            for label in ("TL", "TR", "BR", "BL")
-        }
-    return {label: rotate_map[label] for label in ("TL", "TR", "BR", "BL")}
-
-
-def _transform_point(point, width, height, mirror, rotation):
-    """
-    Transforma un punto (x, y) con las mismas operaciones que
-    cv2.flip / cv2.rotate aplican a una imagen width x height.
-    """
-    x, y = point
-
-    if mirror:
-        x = (width - 1) - x
-
-    if rotation == 0:
-        return (x, y)
-    if rotation == 90:
-        return ((height - 1) - y, x)
-    if rotation == 180:
-        return ((width - 1) - x, (height - 1) - y)
-    if rotation == 270:
-        return (y, (width - 1) - x)
-
-    raise ValueError(f"rotacion invalida: {rotation}")
-
-
-def apply_orientation_correction(rectified, rectified_centers, correction):
-    """
-    Aplica sobre la imagen ya rectificada (y sobre los centros de los
-    markers ya rectificados) el flip horizontal y/o la rotación de
-    90/180/270 grados detectados por detect_orientation_correction,
-    dejando el resultado en la orientación canónica del generador
-    (TL=0, TR=90, BR=180, BL=270).
-
-    Devuelve (rectified_corregida, rectified_centers_corregidos).
-    """
-    if correction["kind"] not in ("rotation", "mirror_rotation"):
-        return rectified, rectified_centers
-
-    height, width = rectified.shape[:2]
-    mirror = correction["mirror"]
-    rotation = correction["rotation"]
-
-    corrected_image = rectified
-    if mirror:
-        corrected_image = cv2.flip(corrected_image, 1)
-    if rotation == 90:
-        corrected_image = cv2.rotate(corrected_image, cv2.ROTATE_90_CLOCKWISE)
-    elif rotation == 180:
-        corrected_image = cv2.rotate(corrected_image, cv2.ROTATE_180)
-    elif rotation == 270:
-        corrected_image = cv2.rotate(corrected_image, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    label_map = _label_permutation(correction)
-    corrected_centers = {}
-    if rectified_centers:
-        for old_label, point in rectified_centers.items():
-            new_label = label_map[old_label]
-            corrected_centers[new_label] = _transform_point(
-                point, width, height, mirror, rotation,
-            )
-
-    return corrected_image, corrected_centers
-
-
-# ============================================================================
-# FASE 6 — DEDUCIR k A PARTIR DE LA CUADRÍCULA RECTIFICADA
-# ============================================================================
-
-def rectify_marker_centers(marker_results, homography):
-    """
-    Transforma los 4 centros de los agujeros blancos (no los corners
-    exteriores) a través de la homografía de rectificación, para
-    medir las distancias reales entre markers ya sin perspectiva.
+    Calcula la homografía que lleva los 4 centros (ya reclasificados
+    por reorder_markers_by_long_short) a un rectángulo con las
+    proporciones REALMENTE medidas (no forzadas a 3:1), y la aplica a
+    TODA la imagen -- no solo al área entre markers -- agregando un
+    margen alrededor para no perder el borde real del código (que
+    está más afuera que los centros) ni el contexto.
     """
     lookup = {m["label"]: m for m in marker_results}
-    labels = ("TL", "TR", "BR", "BL")
+    width, height = measure_rectangle_dimensions(marker_results)
 
-    points = np.array(
-        [lookup[label]["center"] for label in labels], dtype=np.float32,
-    ).reshape(-1, 1, 2)
-
-    rectified = cv2.perspectiveTransform(points, homography).reshape(-1, 2)
-
-    return {label: tuple(point) for label, point in zip(labels, rectified)}
-
-
-def compute_k_and_module_size(rectified_centers):
-    """
-    Deduce k (número de filas de módulos) a partir de las distancias,
-    ya rectificadas, entre los centros de los 4 corner markers.
-
-    El layout del generador coloca los markers de forma que:
-
-        distancia horizontal (centro a centro) = (3k - 1) módulos
-        distancia vertical   (centro a centro) = (k - 1) módulos
-
-    Con las 4 esquinas disponibles hay DOS mediciones independientes
-    de cada distancia (arriba/abajo para la horizontal, izquierda/
-    derecha para la vertical), así que se promedian para mayor
-    robustez -- a diferencia de la versión de 3 markers, que solo
-    tenía una medición de cada una.
-    """
-    tl = rectified_centers["TL"]
-    tr = rectified_centers["TR"]
-    br = rectified_centers["BR"]
-    bl = rectified_centers["BL"]
-
-    horizontal_distance = (distance(tl, tr) + distance(bl, br)) / 2.0
-    vertical_distance = (distance(tl, bl) + distance(tr, br)) / 2.0
-
-    if vertical_distance <= EPS:
+    if width < EPS or height < EPS:
         return None
 
-    ratio = horizontal_distance / vertical_distance
+    avg_module_size_source = float(
+        np.mean([estimate_marker_size(m) for m in marker_results])
+    )
+    margin_px = int(round(avg_module_size_source * margin_modules))
+    width_px = max(int(round(width)), 10)
+    height_px = max(int(round(height)), 10)
+
+    src_points = np.array(
+        [lookup[l]["center"] for l in ("TL", "TR", "BR", "BL")], dtype=np.float32,
+    )
+
+    dst_tl = (float(margin_px), float(margin_px))
+    dst_tr = (float(margin_px + width_px), float(margin_px))
+    dst_br = (float(margin_px + width_px), float(margin_px + height_px))
+    dst_bl = (float(margin_px), float(margin_px + height_px))
+    dst_points = np.array([dst_tl, dst_tr, dst_br, dst_bl], dtype=np.float32)
+
+    canvas_w = width_px + 2 * margin_px
+    canvas_h = height_px + 2 * margin_px
+
+    H = cv2.getPerspectiveTransform(src_points, dst_points)
+    warped = cv2.warpPerspective(
+        image, H, (canvas_w, canvas_h), flags=cv2.INTER_LINEAR,
+    )
+
+    return {
+        "H": H,
+        "warped": warped,
+        "dst_points": {"TL": dst_tl, "TR": dst_tr, "BR": dst_br, "BL": dst_bl},
+        "canvas_size": (canvas_w, canvas_h),
+        "width_px": width_px, "height_px": height_px, "margin_px": margin_px,
+    }
+
+
+# ============================================================================
+# PASO 4 — RECTÁNGULO REAL DEL CÓDIGO
+# ============================================================================
+
+def estimate_module_size_in_destination(marker_results, H):
+    """
+    Proyecta, a través de la misma homografía del paso 3, el tamaño
+    de módulo ya conocido (fase 1, por marker) para estimar cuánto
+    mide un módulo en la imagen YA rectificada. Se promedia sobre los
+    4 markers y sobre las direcciones X e Y por separado (podrían
+    quedar levemente distintas si el escalado de la homografía no es
+    perfectamente isotrópico).
+    """
+    widths = []
+    heights = []
+
+    for marker in marker_results:
+        cx, cy = marker["center"]
+        module_size_source = estimate_marker_size(marker)
+
+        pts_source = np.array([
+            [cx, cy],
+            [cx + module_size_source, cy],
+            [cx, cy + module_size_source],
+        ], dtype=np.float32).reshape(-1, 1, 2)
+
+        pts_dest = cv2.perspectiveTransform(pts_source, H).reshape(-1, 2)
+        center_dest, x_dest, y_dest = pts_dest
+
+        widths.append(distance(center_dest, x_dest))
+        heights.append(distance(center_dest, y_dest))
+
+    return float(np.mean(widths)), float(np.mean(heights))
+
+
+def compute_k_and_module_size(width_px, height_px):
+    """
+    Deduce k (numero de filas de modulos) y el tamano de modulo real
+    a partir del rectangulo de centros YA rectificado (sin
+    perspectiva, ver compute_whole_image_warp). El layout del
+    generador es un invariante conocido:
+
+        width_px  (centro a centro, horizontal) = (3k - 1) * module_size
+        height_px (centro a centro, vertical)   = (k - 1)  * module_size
+
+    Esto reemplaza la estimacion de estimate_module_size_in_destination
+    (que depende de proyectar el tamano fisico del marker a traves de
+    la homografia, y es ruidosa) por un calculo exacto basado solo en
+    las distancias ya medidas entre centros.
+    """
+    if height_px < EPS:
+        return None
+
+    ratio = width_px / height_px
     denominator = ratio - 3.0
     if abs(denominator) < EPS:
         return None
@@ -1215,289 +690,226 @@ def compute_k_and_module_size(rectified_centers):
     if k < 2:
         return None
 
-    module_width = horizontal_distance / (3 * k - 1)
-    module_height = vertical_distance / (k - 1)
-    module_size = (module_width + module_height) / 2.0
+    module_w = width_px / (3 * k - 1)
+    module_h = height_px / (k - 1)
 
     return {
         "k": k,
         "k_float": float(k_float),
-        "module_size": float(module_size),
-        "horizontal_distance": float(horizontal_distance),
-        "vertical_distance": float(vertical_distance),
+        "module_w": float(module_w),
+        "module_h": float(module_h),
+        "module_size": float((module_w + module_h) / 2.0),
     }
 
 
-def draw_grid_debug(rectified_image, rectified_centers, k_info):
+def compute_outer_rectangle(dst_points, module_w, module_h):
     """
-    Dibuja, sobre la imagen ya rectificada, la cuadrícula de 3k x k
-    módulos deducida, y marca los 4 centros de marker rectificados.
+    Rectángulo del borde REAL del código: paralelo al rectángulo de
+    centros, más grande, y a una distancia uniforme hacia afuera en
+    los 4 lados igual al radio de un módulo (mitad de su ancho, mitad
+    de su alto).
     """
-    debug = rectified_image.copy()
-    height, width = debug.shape[:2]
-    k = k_info["k"]
+    margin_x = module_w / 2.0
+    margin_y = module_h / 2.0
 
-    for column in range(3 * k + 1):
-        x = int(round(column * width / (3 * k)))
+    tl = (dst_points["TL"][0] - margin_x, dst_points["TL"][1] - margin_y)
+    tr = (dst_points["TR"][0] + margin_x, dst_points["TR"][1] - margin_y)
+    br = (dst_points["BR"][0] + margin_x, dst_points["BR"][1] + margin_y)
+    bl = (dst_points["BL"][0] - margin_x, dst_points["BL"][1] + margin_y)
+
+    return {"TL": tl, "TR": tr, "BR": br, "BL": bl}
+
+
+def draw_borders_debug(warped, dst_points, outer_points):
+    debug = warped.copy()
+
+    inner_pts = np.array(
+        [dst_points[l] for l in ("TL", "TR", "BR", "BL")], dtype=np.int32,
+    ).reshape(-1, 1, 2)
+    outer_pts = np.array(
+        [outer_points[l] for l in ("TL", "TR", "BR", "BL")], dtype=np.int32,
+    ).reshape(-1, 1, 2)
+
+    cv2.polylines(debug, [inner_pts], True, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.polylines(debug, [outer_pts], True, (255, 0, 0), 3, cv2.LINE_AA)
+
+    return debug
+
+
+# ============================================================================
+# PASO 5 — CUADRÍCULA Y RECORTE DEFINITIVO
+# ============================================================================
+
+def crop_to_outer_rectangle(warped_image, outer_points):
+    height, width = warped_image.shape[:2]
+
+    x0 = max(0, int(round(outer_points["TL"][0])))
+    y0 = max(0, int(round(outer_points["TL"][1])))
+    x1 = min(width, int(round(outer_points["BR"][0])))
+    y1 = min(height, int(round(outer_points["BR"][1])))
+
+    if x1 <= x0 or y1 <= y0:
+        return None, (0, 0)
+
+    cropped = warped_image[y0:y1, x0:x1].copy()
+    return cropped, (x0, y0)
+
+
+def draw_grid_debug(cropped, module_w, module_h, k=None):
+    debug = cropped.copy()
+    height, width = debug.shape[:2]
+
+    if k is not None:
+        cols = 3 * k
+        rows = k
+    else:
+        cols = max(1, int(round(width / module_w))) if module_w > EPS else 1
+        rows = max(1, int(round(height / module_h))) if module_h > EPS else 1
+
+    for c in range(cols + 1):
+        x = int(round(c * width / cols))
         cv2.line(debug, (x, 0), (x, height - 1), (0, 255, 0), 1, cv2.LINE_AA)
 
-    for row in range(k + 1):
-        y = int(round(row * height / k))
+    for r in range(rows + 1):
+        y = int(round(r * height / rows))
         cv2.line(debug, (0, y), (width - 1, y), (0, 255, 0), 1, cv2.LINE_AA)
 
-    for label, point in rectified_centers.items():
-        x = int(round(point[0]))
-        y = int(round(point[1]))
-        cv2.circle(debug, (x, y), 7, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(
-            debug, label, (x + 10, y - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA,
-        )
-
     return debug
 
 
 # ============================================================================
-# DEBUG — IMAGEN GENERAL (candidatos + cuadrilátero aproximado + bandas)
+# PASO 6 — CORRECCIÓN FINAL DE ORIENTACIÓN (180°)
 # ============================================================================
 
-def draw_overview_debug(image, candidates, marker_results, phase2_results, fallback_corners):
-    debug = image.copy()
+def locate_tl_marker_in_cropped(dst_points, crop_offset):
+    x0, y0 = crop_offset
+    tl = dst_points["TL"]
+    return (tl[0] - x0, tl[1] - y0)
 
-    for index, candidate in enumerate(candidates):
-        cx, cy = candidate["center"]
-        center = (int(round(cx)), int(round(cy)))
+def locate_marker_in_cropped(dst_points, crop_offset, label):
+    x0, y0 = crop_offset
+    point = dst_points[label]
+    return (point[0] - x0, point[1] - y0)
 
-        cv2.circle(debug, center, 8, (0, 200, 255), 2)
-        cv2.putText(
-            debug, f"C{index}", (center[0] + 10, center[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 255), 2, cv2.LINE_AA,
+def measure_printed_orientation(image, center, marker_size):
+    """
+    Mide, con el mismo método de bandas de las versiones anteriores
+    (fase 2), la orientación impresa (0/90/180/270) del marker
+    centrado en `center` con tamaño `marker_size`.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    cx, cy = center
+    half = marker_size / 2.0
+    outer = half * BAND_MARGIN
+    inner = half * BAND_END
+
+    def measure_region(x0, y0, x1, y1):
+        x0 = max(0, int(math.floor(x0)))
+        y0 = max(0, int(math.floor(y0)))
+        x1 = min(gray.shape[1], int(math.ceil(x1)))
+        y1 = min(gray.shape[0], int(math.ceil(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        region = gray[y0:y1, x0:x1]
+        if region.size == 0:
+            return 0.0
+        return float(np.count_nonzero(region < DARK_THRESHOLD) / region.size)
+
+    left = measure_region(cx - half + outer, cy - half + outer, cx - half + inner, cy + half - outer)
+    right = measure_region(cx + half - inner, cy - half + outer, cx + half - outer, cy + half - outer)
+    top = measure_region(cx - half + outer, cy - half + outer, cx + half - outer, cy - half + inner)
+    bottom = measure_region(cx - half + outer, cy + half - inner, cx + half - outer, cy + half - outer)
+
+    measurements = {"left": left, "top": top, "right": right, "bottom": bottom}
+    max_side = max(measurements, key=measurements.get)
+
+    # máximo derecha -> 0°, máximo abajo -> 90°, máximo izquierda -> 180°, máximo arriba -> 270°
+    orientation_map = {"right": 0, "bottom": 90, "left": 180, "top": 270}
+    return orientation_map[max_side], measurements
+
+
+def determine_final_rotation(cropped, dst_points, crop_offset, avg_module_size):
+    """
+    IMPORTANTE: EXPECTED_PRINTED_ORIENTATION no es simetrica respecto
+    a un giro de 180 grados (TL=0 y BR=270 -- no son "opuestos"
+    ciclicos por +180). Esto significa que, si la foto esta
+    realmente al reves, el marker que geometricamente cae en la
+    posicion TL del canvas (etiquetado por order_quad segun
+    coordenadas puras) es en realidad, fisicamente, el marker que el
+    generador dibujo en la esquina BR -- la diagonalmente opuesta --
+    y su orientacion medida sera (EXPECTED[BR] + 180) % 360, NO
+    (EXPECTED[TL] + 180) % 360.
+
+    Por eso se evaluan DOS hipotesis por separado para cada marker
+    (sin rotar / rotado 180, comparando contra la esquina opuesta) y
+    se vota cual de las dos explica mejor las 4 mediciones, en vez de
+    exigir diff==0 o diff==180 contra la misma etiqueta.
+    """
+    labels = ("TL", "TR", "BR", "BL")
+    measurements = {}
+    votes = {0: 0, 180: 0}
+
+    for label in labels:
+        center = locate_marker_in_cropped(dst_points, crop_offset, label)
+        measured, bands = measure_printed_orientation(cropped, center, avg_module_size)
+
+        diff_no_rotation = (measured - EXPECTED_PRINTED_ORIENTATION[label]) % 360
+        opposite = OPPOSITE_LABEL[label]
+        diff_180_rotation = (
+            measured - EXPECTED_PRINTED_ORIENTATION[opposite] - 180
+        ) % 360
+
+        measurements[label] = {
+            "measured": measured, "bands": bands,
+            "diff_no_rotation": diff_no_rotation,
+            "diff_180_rotation": diff_180_rotation,
+        }
+
+        if diff_no_rotation == 0 and diff_180_rotation != 0:
+            votes[0] += 1
+        elif diff_180_rotation == 0 and diff_no_rotation != 0:
+            votes[180] += 1
+        # si ninguna (o ambas) calzan exacto, no cuenta como voto --
+        # ese marker se midio con ruido.
+
+    total_votes = votes[0] + votes[180]
+    winner = 180 if votes[180] > votes[0] else 0
+
+    if total_votes >= 3 and votes[winner] >= 3:
+        detail = (
+            f"Consenso {votes[winner]}/{total_votes} a favor de "
+            f"rotacion={winner}. mediciones={measurements}"
         )
+        return winner, detail, measurements
 
-    if not marker_results:
-        return debug
-
-    # Cuadrilátero aproximado (verde), en el orden TL,TR,BR,BL.
-    points = [m["center"] for m in marker_results]
-    pts = np.asarray(points, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(debug, [pts], True, (0, 255, 0), 3, cv2.LINE_AA)
-
-    # Borde exterior estimado (fallback), en azul.
-    if fallback_corners is not None:
-        outer_pts = np.asarray(
-            [fallback_corners["TL"], fallback_corners["TR"],
-             fallback_corners["BR"], fallback_corners["BL"]],
-            dtype=np.int32,
-        ).reshape((-1, 1, 2))
-
-        cv2.polylines(debug, [outer_pts], True, (255, 0, 0), 4, cv2.LINE_AA)
-        for point in outer_pts.reshape(-1, 2):
-            cv2.circle(debug, tuple(point), 7, (255, 0, 0), -1, cv2.LINE_AA)
-
-    for marker in marker_results:
-        x, y = marker["center"]
-        x = int(round(x))
-        y = int(round(y))
-        label = marker["label"]
-
-        cv2.circle(debug, (x, y), DEBUG_RADIUS, (0, 255, 0), 3)
-
-        marker_size = estimate_marker_size(marker)
-        half = marker_size / 2.0
-
-        x0 = int(round(x - half))
-        y0 = int(round(y - half))
-        x1 = int(round(x + half))
-        y1 = int(round(y + half))
-        cv2.rectangle(debug, (x0, y0), (x1, y1), (0, 255, 255), 2, cv2.LINE_AA)
-
-        outer = half * BAND_MARGIN
-        inner = half * BAND_END
-
-        # izquierda / derecha (todo el alto), arriba / abajo (todo el ancho)
-        cv2.rectangle(
-            debug,
-            (int(round(x - half + outer)), int(round(y - half + outer))),
-            (int(round(x - half + inner)), int(round(y + half - outer))),
-            (255, 0, 255), 2,
-        )
-        cv2.rectangle(
-            debug,
-            (int(round(x + half - inner)), int(round(y - half + outer))),
-            (int(round(x + half - outer)), int(round(y + half - outer))),
-            (255, 0, 255), 2,
-        )
-        cv2.rectangle(
-            debug,
-            (int(round(x - half + outer)), int(round(y - half + outer))),
-            (int(round(x + half - outer)), int(round(y - half + inner))),
-            (255, 0, 255), 2,
-        )
-        cv2.rectangle(
-            debug,
-            (int(round(x - half + outer)), int(round(y + half - inner))),
-            (int(round(x + half - outer)), int(round(y + half - outer))),
-            (255, 0, 255), 2,
-        )
-
-        text = label
-        if phase2_results and label in phase2_results:
-            text += f" ({phase2_results[label]['printed_orientation']}°)"
-
-        cv2.putText(
-            debug, text, (x + 22, y - 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.70, (0, 255, 0), 2, cv2.LINE_AA,
-        )
-
-    return debug
-
-
-# ============================================================================
-# DEBUG — IMAGEN DE LÍNEAS PRECISAS (fase 3/4)
-# ============================================================================
-
-def _draw_full_line(debug, line, color, thickness=3):
-    height, width = debug.shape[:2]
-    a, b, c = line
-
-    if abs(b) > abs(a):
-        x0 = 0.0
-        y0 = -(a * x0 + c) / b
-        x1 = float(width - 1)
-        y1 = -(a * x1 + c) / b
-    else:
-        y0 = 0.0
-        x0 = -(b * y0 + c) / a
-        y1 = float(height - 1)
-        x1 = -(b * y1 + c) / a
-
-    cv2.line(
-        debug,
-        (int(round(x0)), int(round(y0))),
-        (int(round(x1)), int(round(y1))),
-        color, thickness, cv2.LINE_AA,
+    detail = (
+        f"Sin consenso suficiente para decidir (votos: {votes}, "
+        f"total evaluable: {total_votes}/4). mediciones={measurements}"
     )
+    return None, detail, measurements
 
 
-def draw_precise_debug(image, marker_geoms, precise_result):
+def apply_final_orientation(cropped, measured_orientation):
     """
-    Dibuja, en coordenadas globales: los segmentos de Hough elegidos
-    por cada marker (cian), las 4 rectas combinadas del código
-    (verde grueso) y los 4 corners exactos (rojo), si se pudieron
-    calcular.
+    Compara la orientación medida del marker TL geométrico contra la
+    esperada (0°) y aplica, como mucho, una rotación de 180°. Si la
+    medición da 90° o 270°, algo falló antes (paso 3): no se corrige
+    a ciegas, porque una rotación de 90° acá invalidaría el recorte
+    ya hecho (que asume el ancho/alto ya correctos).
     """
-    debug = image.copy()
+    expected = EXPECTED_PRINTED_ORIENTATION["TL"]
+    diff = (measured_orientation - expected) % 360
 
-    for label, geometry in marker_geoms.items():
-        if geometry is None:
-            continue
-        for key in ("horizontal", "vertical"):
-            matches = geometry.get(key)
-            if not matches:
-                continue
-            for item in matches:
-                p1 = tuple(int(round(v)) for v in item["p1"])
-                p2 = tuple(int(round(v)) for v in item["p2"])
-                cv2.line(debug, p1, p2, (255, 255, 0), 3, cv2.LINE_AA)
+    if diff == 0:
+        return cropped, 0, "orientacion correcta, no se aplico rotacion"
+    if diff == 180:
+        return cv2.rotate(cropped, cv2.ROTATE_180), 180, "boca abajo detectado, se roto 180"
 
-    if precise_result is None:
-        return debug
-
-    for line in precise_result["edges"].values():
-        _draw_full_line(debug, line, (0, 255, 0), 3)
-
-    for label, point in precise_result["corners"].items():
-        x = int(round(point[0]))
-        y = int(round(point[1]))
-        cv2.circle(debug, (x, y), 9, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(
-            debug, label, (x + 12, y - 12),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA,
-        )
-
-    return debug
-
-
-# ============================================================================
-# REPORTE
-# ============================================================================
-
-def print_report(candidates, best_quad, marker_results, phase2_results,
-                  precise_result, fallback_corners, used_method, k_info):
-
-    print()
-    print("=" * 60)
-    print("LANCHERIX 4-MARKER DETECTOR (con perspectiva)")
-    print("=" * 60)
-
-    print()
-    print(f"Candidatos encontrados: {len(candidates)}")
-    for index, candidate in enumerate(candidates):
-        cx, cy = candidate["center"]
-        print(
-            f"  C{index}: center=({cx:.2f}, {cy:.2f}) "
-            f"area={candidate['area']} score={candidate['score']:.3f}"
-        )
-
-    print()
-    if best_quad is None:
-        print("NO SE ENCONTRO UN CUADRILATERO PLAUSIBLE.")
-        return
-
-    print("CUADRILATERO APROXIMADO (centros de los agujeros)")
-    print("---------------------------------------------------")
-    for marker in marker_results:
-        x, y = marker["center"]
-        print(f"  {marker['label']} = ({x:.2f}, {y:.2f})")
-    print(f"  Area:  {best_quad['area']:.2f}")
-    print(f"  Score: {best_quad['score']:.4f}")
-
-    if phase2_results:
-        print()
-        print("ORIENTACION IMPRESA DE LOS MARKERS (fase 2, banda con más negro)")
-        print("-------------------------------------------------------------------")
-        for label in ("TL", "TR", "BR", "BL"):
-            result = phase2_results.get(label)
-            if result is None:
-                continue
-            print(
-                f"  {label}: izquierda={result['left']:.3f} arriba={result['top']:.3f} "
-                f"derecha={result['right']:.3f} abajo={result['bottom']:.3f} "
-                f"-> mayor={result['max_side']} "
-                f"=> impreso a {result['printed_orientation']}°"
-            )
-
-    print()
-    print("CUADRILATERO EXACTO (fase 3/4, intersección de lados reales)")
-    print("----------------------------------------------------------------")
-    if precise_result is not None:
-        for label in ("TL", "TR", "BR", "BL"):
-            x, y = precise_result["corners"][label]
-            print(f"  {label} = ({x:.2f}, {y:.2f})")
-    else:
-        print("  No se pudo construir (evidencia de líneas insuficiente).")
-
-    print()
-    print(f"Método usado para rectificar: {used_method}")
-
-    if used_method == "fallback" and fallback_corners is not None:
-        print()
-        print("CUADRILATERO ESTIMADO (fallback, a partir del tamaño del agujero)")
-        print("-----------------------------------------------------------------")
-        for label in ("TL", "TR", "BR", "BL"):
-            x, y = fallback_corners[label]
-            print(f"  {label} = ({x:.2f}, {y:.2f})")
-
-    print()
-    print("GRID / k (fase 6, a partir de las distancias entre markers ya rectificadas)")
-    print("-----------------------------------------------------------------------------")
-    if k_info is not None:
-        print(f"  k = {k_info['k']} (estimado {k_info['k_float']:.3f})")
-        print(f"  distancia horizontal (rectificada) = {k_info['horizontal_distance']:.2f}px")
-        print(f"  distancia vertical   (rectificada) = {k_info['vertical_distance']:.2f}px")
-        print(f"  tamaño de módulo estimado = {k_info['module_size']:.2f}px")
-    else:
-        print("  No se pudo deducir k.")
+    return (
+        cropped, 0,
+        f"ORIENTACION INESPERADA ({measured_orientation} grados, se esperaba 0 o 180); "
+        f"no se aplico ninguna correccion -- revisar la clasificacion del paso 3"
+    )
 
 
 # ============================================================================
@@ -1506,14 +918,10 @@ def print_report(candidates, best_quad, marker_results, phase2_results,
 
 def main():
     if len(sys.argv) != 2:
-        print(
-            "Uso:\n"
-            "  python3 lancherix_corner_rectifier_4markers.py imagen.png"
-        )
+        print("Uso:\n  python3 lancherix_corner_rectifier_v3.py imagen.png")
         sys.exit(1)
 
     input_path = Path(sys.argv[1])
-
     if not input_path.exists():
         print(f"ERROR: archivo no encontrado: {input_path}")
         sys.exit(1)
@@ -1523,150 +931,125 @@ def main():
         print(f"ERROR: no se pudo abrir: {input_path}")
         sys.exit(1)
 
+    def out_path(suffix):
+        return input_path.parent / f"{input_path.stem}_{suffix}.png"
+
     print()
-    print("Lancherix 4-Marker Detector (con perspectiva)")
-    print("================================================")
-    print()
+    print("Lancherix Corner Rectifier v3 (logica simplificada)")
+    print("=====================================================")
     print(f"Input: {input_path}")
 
-    # ------------------------------------------------------------------------
-    # FASE 1 — candidatos y cuadrilátero aproximado
-    # ------------------------------------------------------------------------
-
+    # ---------------------------------------------------------------
+    # PASO 1
+    # ---------------------------------------------------------------
     candidates = detect_white_center_candidates(image)
+    print(f"\nCandidatos encontrados: {len(candidates)}")
+
     best_quad = find_best_quad(candidates)
+    if best_quad is None:
+        print("NO SE ENCONTRO UN CUADRILATERO PLAUSIBLE. Abortando.")
+        sys.exit(1)
+
     marker_results = build_marker_results(best_quad)
+    print(f"Cuadrilatero aproximado, score={best_quad['score']:.4f}")
 
-    # ------------------------------------------------------------------------
-    # FASE 2 — bandas internas (heredada)
-    # ------------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # PASO 2
+    # ---------------------------------------------------------------
+    step2_debug = draw_quad_debug(image, marker_results)
+    cv2.imwrite(str(out_path("step2_quad")), step2_debug)
+    print(f"Debug paso 2 generado: {out_path('step2_quad')}")
 
-    phase2_results = (
-        analyze_four_markers(image, marker_results) if marker_results else None
+    # ---------------------------------------------------------------
+    # PASO 3
+    # ---------------------------------------------------------------
+    marker_results_ordered, rotated = reorder_markers_by_long_short(marker_results)
+    print(f"\nClasificacion largo/corto: rotacion de 90 {'SI' if rotated else 'NO'} detectada")
+
+    step3a_debug = draw_side_classification_debug(image, marker_results_ordered, rotated)
+    cv2.imwrite(str(out_path("step3a_clasificacion")), step3a_debug)
+    print(f"Debug paso 3a generado: {out_path('step3a_clasificacion')}")
+
+    warp_info = compute_whole_image_warp(image, marker_results_ordered)
+    if warp_info is None:
+        print("ERROR: no se pudo calcular la homografia (rectangulo degenerado). Abortando.")
+        sys.exit(1)
+
+    cv2.imwrite(str(out_path("step3b_warped")), warp_info["warped"])
+    print(f"Debug paso 3b generado: {out_path('step3b_warped')}")
+    print(
+        f"  Rectangulo de centros medido: {warp_info['width_px']}x{warp_info['height_px']}px "
+        f"(margen: {warp_info['margin_px']}px)"
     )
 
-    # ------------------------------------------------------------------------
-    # FASE 3/4 — lados reales (Hough) + cuadrilátero exacto
-    # ------------------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # PASO 4
+    # ---------------------------------------------------------------
+    k_info = compute_k_and_module_size(warp_info["width_px"], warp_info["height_px"])
 
-    marker_geoms = {}
-    precise_result = None
-
-    if marker_results:
-        marker_geoms = detect_marker_geometries(image, marker_results)
-        precise_result = build_precise_quad(marker_geoms)
-
-    # ------------------------------------------------------------------------
-    # FASE 5 — rectificación, con fallback si la fase 3/4 falló
-    # ------------------------------------------------------------------------
-
-    fallback_corners = (
-        estimate_outer_corners_fallback(marker_results) if marker_results else None
-    )
-
-    rectified = None
-    homography = None
-    used_method = "none"
-
-    if precise_result is not None:
-        rectified, homography = rectify_from_corners(image, precise_result["corners"])
-        if rectified is not None:
-            used_method = "precise"
-
-    if rectified is None and fallback_corners is not None:
-        rectified, homography = rectify_from_corners(image, fallback_corners)
-        if rectified is not None:
-            used_method = "fallback"
-
-    # ------------------------------------------------------------------------
-    # FASE 6 (parte 1) — centros de marker rectificados, ANTES de corregir
-    # orientación (la fase 5b los necesita en coordenadas del rectificado
-    # crudo, para poder permutarlos junto con la imagen).
-    # ------------------------------------------------------------------------
-
-    rectified_centers = None
-
-    if rectified is not None and homography is not None and marker_results:
-        rectified_centers = rectify_marker_centers(marker_results, homography)
-
-    # ------------------------------------------------------------------------
-    # FASE 5b — corrección de orientación (rotación / espejo)
-    #
-    # Debe ejecutarse ANTES de calcular k y de leer la grilla de datos:
-    # corrige rotated/mirrored el `rectified` y sus `rectified_centers`
-    # para que todo lo que viene después (k, imagen de grilla, imagen
-    # canónica, y el lector de símbolos) ya trabaje en la orientación
-    # canónica del generador (TL=0°, TR=90°, BR=0°, BL=90°, sin rotar).
-    # ------------------------------------------------------------------------
-
-    orientation_correction = None
-
-    if rectified is not None:
-        orientation_correction = detect_orientation_correction(phase2_results)
-        rectified, rectified_centers = apply_orientation_correction(
-            rectified, rectified_centers, orientation_correction,
-        )
-
-        print()
-        print("CORRECCION DE ORIENTACION (fase 5b)")
-        print("--------------------------------------")
-        print(f"  {orientation_correction['detail']}")
-        print(
-            f"  Aplicado: rotacion={orientation_correction['rotation']} "
-            f"espejo={orientation_correction['mirror']}"
-        )
-
-    # ------------------------------------------------------------------------
-    # FASE 6 (parte 2) — deducir k a partir de la cuadrícula YA corregida
-    # ------------------------------------------------------------------------
-
-    k_info = None
-    if rectified_centers is not None:
-        k_info = compute_k_and_module_size(rectified_centers)
-
-    # ------------------------------------------------------------------------
-    # REPORTE
-    # ------------------------------------------------------------------------
-
-    print_report(
-        candidates, best_quad, marker_results, phase2_results,
-        precise_result, fallback_corners, used_method, k_info,
-    )
-
-    # ------------------------------------------------------------------------
-    # DEBUG
-    # ------------------------------------------------------------------------
-
-    overview_path = input_path.parent / f"{input_path.stem}_4markers_debug.png"
-    overview = draw_overview_debug(
-        image, candidates, marker_results or [], phase2_results, fallback_corners,
-    )
-    cv2.imwrite(str(overview_path), overview)
-    print()
-    print(f"Debug (overview) generado: {overview_path}")
-
-    if marker_results:
-        precise_path = input_path.parent / f"{input_path.stem}_4markers_precise.png"
-        precise_debug = draw_precise_debug(image, marker_geoms, precise_result)
-        cv2.imwrite(str(precise_path), precise_debug)
-        print(f"Debug (líneas precisas) generado: {precise_path}")
-
-    if rectified is not None:
-        rectified_path = input_path.parent / f"{input_path.stem}_4markers_rectified.png"
-        cv2.imwrite(str(rectified_path), rectified)
-        print(f"Rectificada generada: {rectified_path}")
-        print(
-            f"Tamaño rectificado: {rectified.shape[1]}x{rectified.shape[0]} "
-            f"(método: {used_method})"
-        )
-
-        if k_info is not None:
-            grid_path = input_path.parent / f"{input_path.stem}_4markers_grid.png"
-            grid_debug = draw_grid_debug(rectified, rectified_centers, k_info)
-            cv2.imwrite(str(grid_path), grid_debug)
-            print(f"Debug (cuadrícula, k={k_info['k']}) generado: {grid_path}")
+    if k_info is not None:
+        module_w, module_h = k_info["module_w"], k_info["module_h"]
+        print(f"\nk deducido = {k_info['k']} (estimado {k_info['k_float']:.3f})")
+        print(f"Tamano de modulo (exacto, via k): {module_w:.2f}x{module_h:.2f}px")
     else:
-        print("No se pudo generar la imagen rectificada.")
+        # fallback: si la geometria de centros no da un k valido
+        # (deberia ser raro), se vuelve al metodo anterior.
+        module_w, module_h = estimate_module_size_in_destination(
+            marker_results_ordered, warp_info["H"],
+        )
+        print(f"\nADVERTENCIA: no se pudo deducir k, usando estimacion por marker")
+        print(f"Tamano de modulo estimado (fallback): {module_w:.2f}x{module_h:.2f}px")
+
+    outer_points = compute_outer_rectangle(warp_info["dst_points"], module_w, module_h)
+    step4_debug = draw_borders_debug(warp_info["warped"], warp_info["dst_points"], outer_points)
+    cv2.imwrite(str(out_path("step4_borders")), step4_debug)
+    print(f"Debug paso 4 generado: {out_path('step4_borders')}")
+
+    # ---------------------------------------------------------------
+    # PASO 5
+    # ---------------------------------------------------------------
+    cropped, crop_offset = crop_to_outer_rectangle(warp_info["warped"], outer_points)
+    if cropped is None:
+        print("ERROR: el rectangulo exterior quedo fuera de la imagen. Abortando.")
+        sys.exit(1)
+
+    grid_debug = draw_grid_debug(
+        cropped, module_w, module_h,
+        k=(k_info["k"] if k_info is not None else None),
+    )
+    cv2.imwrite(str(out_path("step5_grid_debug")), grid_debug)
+    cv2.imwrite(str(out_path("step5_cropped")), cropped)
+    print(f"Debug paso 5 generado: {out_path('step5_grid_debug')}")
+    print(f"Recorte limpio generado: {out_path('step5_cropped')}")
+    print(f"  Tamano recortado: {cropped.shape[1]}x{cropped.shape[0]}px")
+
+    # ---------------------------------------------------------------
+    # PASO 6
+    # ---------------------------------------------------------------
+    avg_module_size = (module_w + module_h) / 2.0
+
+    rotation_needed, orientation_note, band_measurements = determine_final_rotation(
+        cropped, warp_info["dst_points"], crop_offset, avg_module_size,
+    )
+
+    if rotation_needed == 180:
+        final_image = cv2.rotate(cropped, cv2.ROTATE_180)
+    else:
+        final_image = cropped
+        rotation_needed = 0
+
+    cv2.imwrite(str(out_path("step6_final")), final_image)
+    print(f"\nOrientacion (paso 6, consenso de 4 markers):")
+    for label, info in band_measurements.items():
+        print(
+            f"  {label}: medido={info['measured']} "
+            f"diff_sin_rot={info['diff_no_rotation']} "
+            f"diff_180={info['diff_180_rotation']} "
+            f"bandas={info['bands']}"
+        )
+    print(f"  {orientation_note}")
+    print(f"  Rotacion aplicada: {rotation_needed} grados")
+    print(f"Final (para el reader) generado: {out_path('step6_final')}")
 
 
 if __name__ == "__main__":

@@ -86,17 +86,14 @@ from lancherix_corner_rectifier_4markers import (
     detect_white_center_candidates,
     find_best_quad,
     build_marker_results,
-    detect_marker_geometries,
-    build_precise_quad,
-    estimate_outer_corners_fallback,
-    rectify_from_corners,
-    rectify_marker_centers,
+    reorder_markers_by_long_short,
+    compute_whole_image_warp,
     compute_k_and_module_size,
-    draw_precise_debug,
+    compute_outer_rectangle,
+    crop_to_outer_rectangle,
+    draw_side_classification_debug,
     draw_grid_debug,
-    analyze_four_markers,
-    detect_orientation_correction,
-    _label_permutation,
+    determine_final_rotation,
 )
 
 
@@ -174,32 +171,74 @@ def _decode_canonical_image(
 # PIPELINE COMPLETO: localizacion + decodificacion via corner markers
 # --------------------------------------------------------------------------
 
+def _map_points_through_inverse_homography(points_dict, H):
+    """
+    Mapea un dict {label: (x, y)} desde el sistema de coordenadas del
+    canvas warpeado de vuelta a coordenadas de la imagen ORIGINAL,
+    invirtiendo la homografia H usada en compute_whole_image_warp.
+    """
+    labels = list(points_dict.keys())
+    pts = np.array([points_dict[l] for l in labels], dtype=np.float32).reshape(-1, 1, 2)
+    H_inv = np.linalg.inv(H)
+    mapped = cv2.perspectiveTransform(pts, H_inv).reshape(-1, 2)
+    return {label: tuple(point) for label, point in zip(labels, mapped)}
+
 def read_camera_image_via_markers(
     image_path: str,
     num_ecc_symbols: int = DEFAULT_ECC_SYMBOLS,
-    debug_images_out: list[str] | None = None,
 ) -> str:
     """
-    ... (docstring igual) ...
+    Localiza un Lancherix Visual Code en una imagen con perspectiva
+    real usando los 4 corner markers, y decodifica el texto (con
+    correccion de errores Reed-Solomon).
 
-    `debug_images_out`, si se pasa, se va completando con el nombre
-    de cada PNG de debug a medida que se generan (scanner, quad,
-    rectified, grid, canonical). Si el pipeline levanta una excepcion
-    a mitad de camino, la lista igual queda con lo que se llego a
-    guardar antes del fallo -- es la forma en que el caller (main.py)
-    puede devolver "las fotos generadas hasta ahora" incluso cuando
-    hay error.
+    A diferencia de un enfoque por fuerza bruta (probar muchos k y
+    muchas correspondencias de vertices), este pipeline es directo:
+
+      1. Detectar los 4 agujeros blancos centrales de los corner
+         markers y armar el cuadrilatero TL/TR/BR/BL aproximado
+         (combinatoria + score geometrico) -- sin ambiguedad de
+         "cual esquina es cual".
+      2. Extraer los lados rectos reales de cada marker (Hough), ya
+         en coordenadas globales.
+      3. Combinar, para cada uno de los 4 lados del codigo, las dos
+         mediciones de los markers que lo tocan en una unica recta
+         (minimos cuadrados), e intersectar esas 4 rectas para
+         obtener el quad EXACTO. No hace falta punto de fuga ni
+         pasada de refinamiento: con los 4 corners detectados
+         directamente, cada lado ya tiene evidencia real de sobra.
+      4. Si esa deteccion de lineas no reune evidencia suficiente
+         (imagen muy borrosa/pequena), caer de vuelta al metodo mas
+         simple que estima el borde exterior a partir del tamano del
+         agujero blanco.
+      5. Deducir k directamente a partir de las distancias
+         rectificadas entre los 4 centros (promediando las dos
+         mediciones de cada distancia, sin probar candidatos).
+      6. Warpear la imagen original a un canvas canonico k x 3k (con
+         quiet zone) usando el quad final, y decodificar con el codec
+         CON ECC (decode_symbols).
+
+    `num_ecc_symbols` debe coincidir con el valor usado al generar el
+    codigo (DEFAULT_ECC_SYMBOLS salvo que se haya generado con otro
+    valor explicito).
+
+    Guarda en disco PNGs de debug (`_quad.png` con las lineas Hough y
+    el quad exacto, `_rectified.png`, `_grid.png` con la cuadricula
+    deducida), mas un canvas canonico final
+    (`_k{k}_canonical_via_markers.png`).
     """
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"No se pudo abrir la imagen: {image_path}")
 
+    # Aplica el efecto scanner (blancos/negros puros) directo sobre la
+    # foto original, sin necesidad de un archivo intermedio en disco.
     scanned = scanner_effect(image)
-    image = cv2.cvtColor(scanned, cv2.COLOR_GRAY2BGR)
-    scanner_path = f"{Path(image_path).stem}_scanner.png"
-    cv2.imwrite(scanner_path, scanned)
-    if debug_images_out is not None:
-        debug_images_out.append(scanner_path)
+    if len(scanned.shape) == 2:
+        image = cv2.cvtColor(scanned, cv2.COLOR_GRAY2BGR)
+    else:
+        image = scanned.copy()
+    cv2.imwrite(f"{Path(image_path).stem}_scanner.png", scanned)
 
     # ------------------------------------------------------------------
     # FASE 1 -- candidatos y cuadrilatero aproximado (TL/TR/BR/BL).
@@ -216,87 +255,42 @@ def read_camera_image_via_markers(
     marker_results = build_marker_results(best_quad)
 
     # ------------------------------------------------------------------
-    # FASE 2/3 -- lados reales (Hough) + cuadrilatero exacto por
-    # interseccion. Si falla, cae al fallback por tamano de agujero.
+    # FASE 2 -- clasificacion largo/corto (resuelve 90/270) + warp de
+    # toda la imagen a un rectangulo con las proporciones medidas.
     # ------------------------------------------------------------------
-    marker_geoms = detect_marker_geometries(image, marker_results)
-    precise_result = build_precise_quad(marker_geoms)
+    marker_results_ordered, rotated_90 = reorder_markers_by_long_short(marker_results)
 
-    if precise_result is not None:
-        corners = precise_result["corners"]
-    else:
-        corners = estimate_outer_corners_fallback(marker_results)
-        if corners is None:
-            raise ValueError(
-                "No se pudo construir el cuadrilatero (ni por lineas "
-                "reales ni por el metodo de respaldo) a partir de los "
-                "corner markers detectados."
-            )
-
-    # ------------------------------------------------------------------
-    # FASE 2 -- bandas internas + deteccion de rotacion/espejo.
-    #
-    # `corners` (de precise_result o del fallback) esta etiquetado por
-    # POSICION en la imagen (el punto mas arriba-izquierda se llama
-    # "TL"), no por identidad fisica del marker impreso. Si el codigo
-    # esta rotado 180 grados en la foto, ese punto "TL" por posicion
-    # es en realidad la esquina impresa como BR. Hay que remapear las
-    # etiquetas a la identidad fisica real antes de usar `corners`
-    # para el warp canonico final, o el codigo se lee empezando por
-    # la esquina equivocada.
-    # ------------------------------------------------------------------
-    phase2_results = analyze_four_markers(image, marker_results)
-    orientation_correction = detect_orientation_correction(phase2_results)
-    label_map = _label_permutation(orientation_correction)  # {pos_label: physical_label}
-
-    corners = {label_map[pos_label]: point for pos_label, point in corners.items()}
-
-    print()
-    print("ORIENTATION CORRECTION")
-    print("-----------------------")
-    print(f"  {orientation_correction['detail']}")
-    print(
-        f"  rotacion={orientation_correction['rotation']} "
-        f"espejo={orientation_correction['mirror']}"
-    )
-
-    # ------------------------------------------------------------------
-    # FASE 4 -- rectificacion (proporcion 3:1 fija) + debug.
-    # ------------------------------------------------------------------
-    rectified, homography = rectify_from_corners(image, corners)
-
-    if rectified is None:
+    warp_info = compute_whole_image_warp(image, marker_results_ordered)
+    if warp_info is None:
         raise ValueError(
-            "No se pudo rectificar la imagen a partir del cuadrilatero "
-            "detectado."
+            "No se pudo calcular la homografia a partir de los corner "
+            "markers detectados (rectangulo degenerado)."
         )
 
     input_name = Path(image_path).stem
 
     quad_debug_path = f"{input_name}_quad.png"
-    cv2.imwrite(quad_debug_path, draw_precise_debug(image, marker_geoms, precise_result))
-    if debug_images_out is not None:
-        debug_images_out.append(quad_debug_path)
+    cv2.imwrite(
+        quad_debug_path,
+        draw_side_classification_debug(image, marker_results_ordered, rotated_90),
+    )
     print()
     print("QUAD IMAGE SAVED")
     print("----------------")
     print(quad_debug_path)
 
     rectified_debug_path = f"{input_name}_rectified.png"
-    cv2.imwrite(rectified_debug_path, rectified)
-    if debug_images_out is not None:
-        debug_images_out.append(rectified_debug_path)
+    cv2.imwrite(rectified_debug_path, warp_info["warped"])
     print()
     print("RECTIFIED IMAGE SAVED")
     print("---------------------")
     print(rectified_debug_path)
 
     # ------------------------------------------------------------------
-    # FASE 5 -- k YA CONOCIDO: se deduce directo, sin probar candidatos.
+    # FASE 3 -- k y tamano de modulo, deducidos directo de las
+    # distancias entre centros ya rectificados.
     # ------------------------------------------------------------------
-    rectified_centers = rectify_marker_centers(marker_results, homography)
-    k_info = compute_k_and_module_size(rectified_centers)
-
+    k_info = compute_k_and_module_size(warp_info["width_px"], warp_info["height_px"])
     if k_info is None:
         raise ValueError(
             "No se pudo deducir k (num_rows) a partir de los corner "
@@ -304,21 +298,79 @@ def read_camera_image_via_markers(
         )
 
     k = k_info["k"]
+    module_w, module_h = k_info["module_w"], k_info["module_h"]
+    avg_module_size = k_info["module_size"]
+
+    print()
+    print(f"k = {k} (estimado {k_info['k_float']:.3f})")
+    print(f"modulo estimado = {avg_module_size:.2f}px")
+
+    # ------------------------------------------------------------------
+    # FASE 4 -- rectangulo exterior real del codigo + recorte, sobre el
+    # canvas warpeado (todavia en coordenadas geometricas, no fisicas).
+    # ------------------------------------------------------------------
+    outer_points = compute_outer_rectangle(warp_info["dst_points"], module_w, module_h)
+
+    cropped, crop_offset = crop_to_outer_rectangle(warp_info["warped"], outer_points)
+    if cropped is None:
+        raise ValueError(
+            "El rectangulo exterior del codigo quedo fuera de la "
+            "imagen warpeada."
+        )
 
     grid_debug_path = f"{input_name}_grid.png"
-    cv2.imwrite(grid_debug_path, draw_grid_debug(rectified, rectified_centers, k_info))
-    if debug_images_out is not None:
-        debug_images_out.append(grid_debug_path)
+    cv2.imwrite(grid_debug_path, draw_grid_debug(cropped, module_w, module_h, k=k))
     print()
     print("GRID IMAGE SAVED")
     print("----------------")
     print(grid_debug_path)
+
+    # ------------------------------------------------------------------
+    # FASE 5 -- ambiguedad de 180 grados. Aca NO rotamos pixels: en vez
+    # de eso, usamos el resultado para decidir como emparejar las
+    # etiquetas geometricas (TL/TR/BR/BL) con la identidad fisica real
+    # de cada esquina antes del warp final. Rotar los pixels del
+    # recorte invertiria el orden de lectura de TODA la grilla, no solo
+    # de las esquinas -- emparejar las etiquetas antes del warp es
+    # equivalente y no tiene ese problema.
+    # ------------------------------------------------------------------
+    rotation_needed, orientation_note, band_measurements = determine_final_rotation(
+        cropped, warp_info["dst_points"], crop_offset, avg_module_size,
+    )
+
     print()
-    print(f"k = {k} (estimado {k_info['k_float']:.3f})")
-    print(f"modulo estimado = {k_info['module_size']:.2f}px")
+    print("ORIENTATION CORRECTION")
+    print("-----------------------")
+    for label, info in band_measurements.items():
+        print(
+            f"  {label}: medido={info['measured']} "
+            f"diff_sin_rot={info['diff_no_rotation']} "
+            f"diff_180={info['diff_180_rotation']}"
+        )
+    print(f"  {orientation_note}")
+
+    if rotation_needed is None:
+        print("  ADVERTENCIA: sin consenso de orientacion, se asume 0 grados")
+        rotation_needed = 0
+
+    outer_points_original = _map_points_through_inverse_homography(
+        outer_points, warp_info["H"],
+    )
+
+    if rotation_needed == 180:
+        corners = {
+            "TL": outer_points_original["BR"],
+            "TR": outer_points_original["BL"],
+            "BR": outer_points_original["TL"],
+            "BL": outer_points_original["TR"],
+        }
+    else:
+        corners = outer_points_original
+
+    print(f"  rotacion aplicada (via emparejamiento de esquinas)={rotation_needed}")
 
     row_width = GRID_ASPECT_RATIO * k
-
+    
     # ------------------------------------------------------------------
     # Warp FINAL directo: imagen original -> canvas canonico CON quiet
     # zone (mismo formato que espera _decode_canonical_image), en un
@@ -357,8 +409,6 @@ def read_camera_image_via_markers(
 
     canonical_path = f"{input_name}_k{k}_canonical_via_markers.png"
     cv2.imwrite(canonical_path, canonical_bgr)
-    if debug_images_out is not None:
-        debug_images_out.append(canonical_path)
 
     print()
     print("CANONICAL IMAGE SAVED (via corner markers)")
