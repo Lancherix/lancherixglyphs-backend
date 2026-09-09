@@ -540,12 +540,6 @@ def reorder_markers_by_long_short(marker_results):
 
 
 def draw_side_classification_debug(image, marker_results, rotated):
-    """
-    Muestra, sobre la imagen original, cuáles lados del cuadrilátero
-    de centros se clasificaron como largos (rojo, van a ser
-    arriba/abajo) y cuáles como cortos (azul, van a ser
-    izquierda/derecha).
-    """
     debug = image.copy()
     lookup = {m["label"]: m for m in marker_results}
     tl, tr, br, bl = (lookup[l]["center"] for l in ("TL", "TR", "BR", "BL"))
@@ -553,8 +547,8 @@ def draw_side_classification_debug(image, marker_results, rotated):
     def to_int(p):
         return (int(round(p[0])), int(round(p[1])))
 
-    long_color = (0, 0, 255)   # rojo = lado largo -> arriba/abajo
-    short_color = (255, 0, 0)  # azul = lado corto -> izquierda/derecha
+    long_color = (0, 0, 255)
+    short_color = (255, 0, 0)
 
     cv2.line(debug, to_int(tl), to_int(tr), long_color, 4, cv2.LINE_AA)
     cv2.line(debug, to_int(bl), to_int(br), long_color, 4, cv2.LINE_AA)
@@ -579,14 +573,6 @@ def draw_side_classification_debug(image, marker_results, rotated):
 
 
 def compute_whole_image_warp(image, marker_results, margin_modules=MARGIN_MODULES):
-    """
-    Calcula la homografía que lleva los 4 centros (ya reclasificados
-    por reorder_markers_by_long_short) a un rectángulo con las
-    proporciones REALMENTE medidas (no forzadas a 3:1), y la aplica a
-    TODA la imagen -- no solo al área entre markers -- agregando un
-    margen alrededor para no perder el borde real del código (que
-    está más afuera que los centros) ni el contexto.
-    """
     lookup = {m["label"]: m for m in marker_results}
     width, height = measure_rectangle_dimensions(marker_results)
 
@@ -632,14 +618,6 @@ def compute_whole_image_warp(image, marker_results, margin_modules=MARGIN_MODULE
 # ============================================================================
 
 def estimate_module_size_in_destination(marker_results, H):
-    """
-    Proyecta, a través de la misma homografía del paso 3, el tamaño
-    de módulo ya conocido (fase 1, por marker) para estimar cuánto
-    mide un módulo en la imagen YA rectificada. Se promedia sobre los
-    4 markers y sobre las direcciones X e Y por separado (podrían
-    quedar levemente distintas si el escalado de la homografía no es
-    perfectamente isotrópico).
-    """
     widths = []
     heights = []
 
@@ -663,20 +641,6 @@ def estimate_module_size_in_destination(marker_results, H):
 
 
 def compute_k_and_module_size(width_px, height_px):
-    """
-    Deduce k (numero de filas de modulos) y el tamano de modulo real
-    a partir del rectangulo de centros YA rectificado (sin
-    perspectiva, ver compute_whole_image_warp). El layout del
-    generador es un invariante conocido:
-
-        width_px  (centro a centro, horizontal) = (3k - 1) * module_size
-        height_px (centro a centro, vertical)   = (k - 1)  * module_size
-
-    Esto reemplaza la estimacion de estimate_module_size_in_destination
-    (que depende de proyectar el tamano fisico del marker a traves de
-    la homografia, y es ruidosa) por un calculo exacto basado solo en
-    las distancias ya medidas entre centros.
-    """
     if height_px < EPS:
         return None
 
@@ -704,10 +668,10 @@ def compute_k_and_module_size(width_px, height_px):
 
 def compute_outer_rectangle(dst_points, module_w, module_h):
     """
-    Rectángulo del borde REAL del código: paralelo al rectángulo de
-    centros, más grande, y a una distancia uniforme hacia afuera en
-    los 4 lados igual al radio de un módulo (mitad de su ancho, mitad
-    de su alto).
+    Metodo FORMULA (heredado): asume que el borde real esta a exactamente
+    medio modulo del centro del marker. Se deja como fallback -- ver
+    measure_outer_rectangle_from_content, que es el metodo preferido y
+    mide el borde real directamente sobre los pixeles en vez de asumirlo.
     """
     margin_x = module_w / 2.0
     margin_y = module_h / 2.0
@@ -718,6 +682,83 @@ def compute_outer_rectangle(dst_points, module_w, module_h):
     bl = (dst_points["BL"][0] - margin_x, dst_points["BL"][1] + margin_y)
 
     return {"TL": tl, "TR": tr, "BR": br, "BL": bl}
+
+
+CONTENT_DARK_THRESHOLD = 128
+CONTENT_SEED_RADII_FRACTIONS = (0.25, 0.35, 0.45)
+CONTENT_SEED_ANGLE_STEP_DEG = 15
+
+
+def measure_outer_rectangle_from_content(warped, dst_points, module_size):
+    """
+    Mide el rectangulo exterior real DIRECTAMENTE sobre el contenido negro
+    de la imagen ya rectificada (paso 3b), en vez de asumirlo con una
+    formula. Cualquier formula basada en el tamano de modulo (ya sea la
+    de compute_k_and_module_size o la de estimate_module_size_in_destination)
+    es una PREDICCION de donde deberia estar el borde; esto en cambio lo
+    MIDE, por lo que no depende de que esas estimaciones sean exactas.
+
+    Metodo:
+      1. Binariza la imagen (negro = tinta del codigo).
+      2. Etiqueta componentes conexas del negro.
+      3. Para cada uno de los 4 markers, busca un pixel negro cerca de su
+         centro (el centro mismo es blanco -- es el agujero -- así que se
+         muestrea en un anillo alrededor) y anota a que componente
+         pertenece.
+      4. El rectangulo exterior es la union de los bounding boxes de esas
+         componentes (los 4 markers y todo lo que este conectado a ellos,
+         que en este diseño es la totalidad del patron impreso).
+
+    Devuelve outer_points en el mismo formato que compute_outer_rectangle,
+    o None si no se pudo encontrar un pixel negro cerca de algun marker
+    (imagen degenerada / marker mal ubicado).
+    """
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    _, dark_mask = cv2.threshold(gray, CONTENT_DARK_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dark_mask, connectivity=8)
+
+    height, width = labels.shape
+    seed_labels = set()
+
+    for label_name in ("TL", "TR", "BR", "BL"):
+        cx, cy = dst_points[label_name]
+        found_label = None
+
+        for angle_deg in range(0, 360, CONTENT_SEED_ANGLE_STEP_DEG):
+            angle = math.radians(angle_deg)
+            for fraction in CONTENT_SEED_RADII_FRACTIONS:
+                radius = module_size * fraction
+                x = int(round(cx + radius * math.cos(angle)))
+                y = int(round(cy + radius * math.sin(angle)))
+                if 0 <= x < width and 0 <= y < height:
+                    candidate_label = labels[y, x]
+                    if candidate_label != 0:
+                        found_label = candidate_label
+                        break
+            if found_label is not None:
+                break
+
+        if found_label is None:
+            return None
+
+        seed_labels.add(found_label)
+
+    x0s, y0s, x1s, y1s = [], [], [], []
+    for label in seed_labels:
+        x, y, w, h, _area = stats[label]
+        x0s.append(x)
+        y0s.append(y)
+        x1s.append(x + w)
+        y1s.append(y + h)
+
+    bx0, by0, bx1, by1 = min(x0s), min(y0s), max(x1s), max(y1s)
+
+    return {
+        "TL": (float(bx0), float(by0)),
+        "TR": (float(bx1), float(by0)),
+        "BR": (float(bx1), float(by1)),
+        "BL": (float(bx0), float(by1)),
+    }
 
 
 def draw_borders_debug(warped, dst_points, outer_points):
@@ -792,11 +833,6 @@ def locate_marker_in_cropped(dst_points, crop_offset, label):
     return (point[0] - x0, point[1] - y0)
 
 def measure_printed_orientation(image, center, marker_size):
-    """
-    Mide, con el mismo método de bandas de las versiones anteriores
-    (fase 2), la orientación impresa (0/90/180/270) del marker
-    centrado en `center` con tamaño `marker_size`.
-    """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     cx, cy = center
     half = marker_size / 2.0
@@ -823,28 +859,11 @@ def measure_printed_orientation(image, center, marker_size):
     measurements = {"left": left, "top": top, "right": right, "bottom": bottom}
     max_side = max(measurements, key=measurements.get)
 
-    # máximo derecha -> 0°, máximo abajo -> 90°, máximo izquierda -> 180°, máximo arriba -> 270°
     orientation_map = {"right": 0, "bottom": 90, "left": 180, "top": 270}
     return orientation_map[max_side], measurements
 
 
 def determine_final_rotation(cropped, dst_points, crop_offset, avg_module_size):
-    """
-    IMPORTANTE: EXPECTED_PRINTED_ORIENTATION no es simetrica respecto
-    a un giro de 180 grados (TL=0 y BR=270 -- no son "opuestos"
-    ciclicos por +180). Esto significa que, si la foto esta
-    realmente al reves, el marker que geometricamente cae en la
-    posicion TL del canvas (etiquetado por order_quad segun
-    coordenadas puras) es en realidad, fisicamente, el marker que el
-    generador dibujo en la esquina BR -- la diagonalmente opuesta --
-    y su orientacion medida sera (EXPECTED[BR] + 180) % 360, NO
-    (EXPECTED[TL] + 180) % 360.
-
-    Por eso se evaluan DOS hipotesis por separado para cada marker
-    (sin rotar / rotado 180, comparando contra la esquina opuesta) y
-    se vota cual de las dos explica mejor las 4 mediciones, en vez de
-    exigir diff==0 o diff==180 contra la misma etiqueta.
-    """
     labels = ("TL", "TR", "BR", "BL")
     measurements = {}
     votes = {0: 0, 180: 0}
@@ -869,8 +888,6 @@ def determine_final_rotation(cropped, dst_points, crop_offset, avg_module_size):
             votes[0] += 1
         elif diff_180_rotation == 0 and diff_no_rotation != 0:
             votes[180] += 1
-        # si ninguna (o ambas) calzan exacto, no cuenta como voto --
-        # ese marker se midio con ruido.
 
     total_votes = votes[0] + votes[180]
     winner = 180 if votes[180] > votes[0] else 0
@@ -890,13 +907,6 @@ def determine_final_rotation(cropped, dst_points, crop_offset, avg_module_size):
 
 
 def apply_final_orientation(cropped, measured_orientation):
-    """
-    Compara la orientación medida del marker TL geométrico contra la
-    esperada (0°) y aplica, como mucho, una rotación de 180°. Si la
-    medición da 90° o 270°, algo falló antes (paso 3): no se corrige
-    a ciegas, porque una rotación de 90° acá invalidaría el recorte
-    ya hecho (que asume el ancho/alto ya correctos).
-    """
     expected = EXPECTED_PRINTED_ORIENTATION["TL"]
     diff = (measured_orientation - expected) % 360
 
@@ -939,9 +949,6 @@ def main():
     print("=====================================================")
     print(f"Input: {input_path}")
 
-    # ---------------------------------------------------------------
-    # PASO 1
-    # ---------------------------------------------------------------
     candidates = detect_white_center_candidates(image)
     print(f"\nCandidatos encontrados: {len(candidates)}")
 
@@ -953,16 +960,10 @@ def main():
     marker_results = build_marker_results(best_quad)
     print(f"Cuadrilatero aproximado, score={best_quad['score']:.4f}")
 
-    # ---------------------------------------------------------------
-    # PASO 2
-    # ---------------------------------------------------------------
     step2_debug = draw_quad_debug(image, marker_results)
     cv2.imwrite(str(out_path("step2_quad")), step2_debug)
     print(f"Debug paso 2 generado: {out_path('step2_quad')}")
 
-    # ---------------------------------------------------------------
-    # PASO 3
-    # ---------------------------------------------------------------
     marker_results_ordered, rotated = reorder_markers_by_long_short(marker_results)
     print(f"\nClasificacion largo/corto: rotacion de 90 {'SI' if rotated else 'NO'} detectada")
 
@@ -982,32 +983,51 @@ def main():
         f"(margen: {warp_info['margin_px']}px)"
     )
 
-    # ---------------------------------------------------------------
-    # PASO 4
-    # ---------------------------------------------------------------
+    # El tamaño de módulo que de verdad importa para el borde (paso 4) es
+    # el medido directamente sobre el glifo/agujero de cada marker
+    # (estimate_module_size_in_destination), NO el derivado de la fórmula
+    # de layout (3k-1)/(k-1) aplicada a la distancia entre centros: esa
+    # fórmula asume que el marker está exactamente a medio módulo del
+    # borde real, y en la práctica la distancia medida entre centros no
+    # calza con esa idealización lo bastante bien -- el error observado
+    # ronda el 8-9% y varía de foto en foto, por lo que a veces "just
+    # about" alcanza y a veces no. Usar la medición directa del marker es
+    # más confiable porque no depende de esa suposición geométrica.
+    module_w, module_h = estimate_module_size_in_destination(
+        marker_results_ordered, warp_info["H"],
+    )
+    print(f"\nTamano de modulo (medido sobre el glifo del marker): {module_w:.2f}x{module_h:.2f}px")
+
+    # compute_k_and_module_size se sigue usando, pero solo para obtener k
+    # (numero de filas de modulos), que se necesita en el paso 5 para
+    # dibujar la cuadricula -- k coincide entre ambos metodos aunque el
+    # tamano de modulo derivado de el no sea confiable para el borde.
     k_info = compute_k_and_module_size(warp_info["width_px"], warp_info["height_px"])
-
     if k_info is not None:
-        module_w, module_h = k_info["module_w"], k_info["module_h"]
-        print(f"\nk deducido = {k_info['k']} (estimado {k_info['k_float']:.3f})")
-        print(f"Tamano de modulo (exacto, via k): {module_w:.2f}x{module_h:.2f}px")
-    else:
-        # fallback: si la geometria de centros no da un k valido
-        # (deberia ser raro), se vuelve al metodo anterior.
-        module_w, module_h = estimate_module_size_in_destination(
-            marker_results_ordered, warp_info["H"],
+        print(f"k deducido = {k_info['k']} (estimado {k_info['k_float']:.3f})")
+        print(
+            f"[DIAGNOSTICO] tamano de modulo via formula (3k-1)/(k-1): "
+            f"{k_info['module_w']:.2f}x{k_info['module_h']:.2f}px "
+            f"(diff vs medido: "
+            f"{100*abs(k_info['module_w']-module_w)/module_w:.1f}% / "
+            f"{100*abs(k_info['module_h']-module_h)/module_h:.1f}%)"
         )
-        print(f"\nADVERTENCIA: no se pudo deducir k, usando estimacion por marker")
-        print(f"Tamano de modulo estimado (fallback): {module_w:.2f}x{module_h:.2f}px")
+    else:
+        print("ADVERTENCIA: no se pudo deducir k por formula; el grid del paso 5 usara modulo/tamano en su lugar.")
 
-    outer_points = compute_outer_rectangle(warp_info["dst_points"], module_w, module_h)
+    avg_module_size_dest = (module_w + module_h) / 2.0
+    outer_points = measure_outer_rectangle_from_content(
+        warp_info["warped"], warp_info["dst_points"], avg_module_size_dest,
+    )
+    if outer_points is not None:
+        print("Borde exterior: medido directamente sobre el contenido negro (metodo preferido).")
+    else:
+        print("ADVERTENCIA: no se pudo medir el borde sobre el contenido; usando formula de modulo como fallback.")
+        outer_points = compute_outer_rectangle(warp_info["dst_points"], module_w, module_h)
     step4_debug = draw_borders_debug(warp_info["warped"], warp_info["dst_points"], outer_points)
     cv2.imwrite(str(out_path("step4_borders")), step4_debug)
     print(f"Debug paso 4 generado: {out_path('step4_borders')}")
 
-    # ---------------------------------------------------------------
-    # PASO 5
-    # ---------------------------------------------------------------
     cropped, crop_offset = crop_to_outer_rectangle(warp_info["warped"], outer_points)
     if cropped is None:
         print("ERROR: el rectangulo exterior quedo fuera de la imagen. Abortando.")
@@ -1023,9 +1043,6 @@ def main():
     print(f"Recorte limpio generado: {out_path('step5_cropped')}")
     print(f"  Tamano recortado: {cropped.shape[1]}x{cropped.shape[0]}px")
 
-    # ---------------------------------------------------------------
-    # PASO 6
-    # ---------------------------------------------------------------
     avg_module_size = (module_w + module_h) / 2.0
 
     rotation_needed, orientation_note, band_measurements = determine_final_rotation(
