@@ -186,6 +186,7 @@ def _map_points_through_inverse_homography(points_dict, H):
 def read_camera_image_via_markers(
     image_path: str,
     num_ecc_symbols: int = DEFAULT_ECC_SYMBOLS,
+    debug_images_out: list | None = None,
 ) -> str:
     """
     Localiza un Lancherix Visual Code en una imagen con perspectiva
@@ -227,6 +228,8 @@ def read_camera_image_via_markers(
     deducida), mas un canvas canonico final
     (`_k{k}_canonical_via_markers.png`).
     """
+    if debug_images_out is None:
+        debug_images_out = []
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"No se pudo abrir la imagen: {image_path}")
@@ -239,6 +242,7 @@ def read_camera_image_via_markers(
     else:
         image = scanned.copy()
     cv2.imwrite(f"{Path(image_path).stem}_scanner.png", scanned)
+    debug_images_out.append(f"{Path(image_path).stem}_scanner.png")
 
     # ------------------------------------------------------------------
     # FASE 1 -- candidatos y cuadrilatero aproximado (TL/TR/BR/BL).
@@ -274,6 +278,7 @@ def read_camera_image_via_markers(
         quad_debug_path,
         draw_side_classification_debug(image, marker_results_ordered, rotated_90),
     )
+    debug_images_out.append(quad_debug_path)
     print()
     print("QUAD IMAGE SAVED")
     print("----------------")
@@ -281,6 +286,7 @@ def read_camera_image_via_markers(
 
     rectified_debug_path = f"{input_name}_rectified.png"
     cv2.imwrite(rectified_debug_path, warp_info["warped"])
+    debug_images_out.append(rectified_debug_path)
     print()
     print("RECTIFIED IMAGE SAVED")
     print("---------------------")
@@ -320,6 +326,7 @@ def read_camera_image_via_markers(
 
     grid_debug_path = f"{input_name}_grid.png"
     cv2.imwrite(grid_debug_path, draw_grid_debug(cropped, module_w, module_h, k=k))
+    debug_images_out.append(grid_debug_path)
     print()
     print("GRID IMAGE SAVED")
     print("----------------")
@@ -409,6 +416,7 @@ def read_camera_image_via_markers(
 
     canonical_path = f"{input_name}_k{k}_canonical_via_markers.png"
     cv2.imwrite(canonical_path, canonical_bgr)
+    debug_images_out.append(canonical_path)
 
     print()
     print("CANONICAL IMAGE SAVED (via corner markers)")
