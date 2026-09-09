@@ -177,59 +177,29 @@ def _decode_canonical_image(
 def read_camera_image_via_markers(
     image_path: str,
     num_ecc_symbols: int = DEFAULT_ECC_SYMBOLS,
+    debug_images_out: list[str] | None = None,
 ) -> str:
     """
-    Localiza un Lancherix Visual Code en una imagen con perspectiva
-    real usando los 4 corner markers, y decodifica el texto (con
-    correccion de errores Reed-Solomon).
+    ... (docstring igual) ...
 
-    A diferencia de un enfoque por fuerza bruta (probar muchos k y
-    muchas correspondencias de vertices), este pipeline es directo:
-
-      1. Detectar los 4 agujeros blancos centrales de los corner
-         markers y armar el cuadrilatero TL/TR/BR/BL aproximado
-         (combinatoria + score geometrico) -- sin ambiguedad de
-         "cual esquina es cual".
-      2. Extraer los lados rectos reales de cada marker (Hough), ya
-         en coordenadas globales.
-      3. Combinar, para cada uno de los 4 lados del codigo, las dos
-         mediciones de los markers que lo tocan en una unica recta
-         (minimos cuadrados), e intersectar esas 4 rectas para
-         obtener el quad EXACTO. No hace falta punto de fuga ni
-         pasada de refinamiento: con los 4 corners detectados
-         directamente, cada lado ya tiene evidencia real de sobra.
-      4. Si esa deteccion de lineas no reune evidencia suficiente
-         (imagen muy borrosa/pequena), caer de vuelta al metodo mas
-         simple que estima el borde exterior a partir del tamano del
-         agujero blanco.
-      5. Deducir k directamente a partir de las distancias
-         rectificadas entre los 4 centros (promediando las dos
-         mediciones de cada distancia, sin probar candidatos).
-      6. Warpear la imagen original a un canvas canonico k x 3k (con
-         quiet zone) usando el quad final, y decodificar con el codec
-         CON ECC (decode_symbols).
-
-    `num_ecc_symbols` debe coincidir con el valor usado al generar el
-    codigo (DEFAULT_ECC_SYMBOLS salvo que se haya generado con otro
-    valor explicito).
-
-    Guarda en disco PNGs de debug (`_quad.png` con las lineas Hough y
-    el quad exacto, `_rectified.png`, `_grid.png` con la cuadricula
-    deducida), mas un canvas canonico final
-    (`_k{k}_canonical_via_markers.png`).
+    `debug_images_out`, si se pasa, se va completando con el nombre
+    de cada PNG de debug a medida que se generan (scanner, quad,
+    rectified, grid, canonical). Si el pipeline levanta una excepcion
+    a mitad de camino, la lista igual queda con lo que se llego a
+    guardar antes del fallo -- es la forma en que el caller (main.py)
+    puede devolver "las fotos generadas hasta ahora" incluso cuando
+    hay error.
     """
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"No se pudo abrir la imagen: {image_path}")
 
-    # Aplica el efecto scanner (blancos/negros puros) directo sobre la
-    # foto original, sin necesidad de un archivo intermedio en disco.
     scanned = scanner_effect(image)
-    if len(scanned.shape) == 2:
-        image = cv2.cvtColor(scanned, cv2.COLOR_GRAY2BGR)
-    else:
-        image = scanned.copy()
-    cv2.imwrite(f"{Path(image_path).stem}_scanner.png", scanned)
+    image = cv2.cvtColor(scanned, cv2.COLOR_GRAY2BGR)
+    scanner_path = f"{Path(image_path).stem}_scanner.png"
+    cv2.imwrite(scanner_path, scanned)
+    if debug_images_out is not None:
+        debug_images_out.append(scanner_path)
 
     # ------------------------------------------------------------------
     # FASE 1 -- candidatos y cuadrilatero aproximado (TL/TR/BR/BL).
@@ -305,6 +275,8 @@ def read_camera_image_via_markers(
 
     quad_debug_path = f"{input_name}_quad.png"
     cv2.imwrite(quad_debug_path, draw_precise_debug(image, marker_geoms, precise_result))
+    if debug_images_out is not None:
+        debug_images_out.append(quad_debug_path)
     print()
     print("QUAD IMAGE SAVED")
     print("----------------")
@@ -312,6 +284,8 @@ def read_camera_image_via_markers(
 
     rectified_debug_path = f"{input_name}_rectified.png"
     cv2.imwrite(rectified_debug_path, rectified)
+    if debug_images_out is not None:
+        debug_images_out.append(rectified_debug_path)
     print()
     print("RECTIFIED IMAGE SAVED")
     print("---------------------")
@@ -333,6 +307,8 @@ def read_camera_image_via_markers(
 
     grid_debug_path = f"{input_name}_grid.png"
     cv2.imwrite(grid_debug_path, draw_grid_debug(rectified, rectified_centers, k_info))
+    if debug_images_out is not None:
+        debug_images_out.append(grid_debug_path)
     print()
     print("GRID IMAGE SAVED")
     print("----------------")
@@ -381,6 +357,8 @@ def read_camera_image_via_markers(
 
     canonical_path = f"{input_name}_k{k}_canonical_via_markers.png"
     cv2.imwrite(canonical_path, canonical_bgr)
+    if debug_images_out is not None:
+        debug_images_out.append(canonical_path)
 
     print()
     print("CANONICAL IMAGE SAVED (via corner markers)")
