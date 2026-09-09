@@ -32,6 +32,34 @@ Los prints de lancherix_camera_reader.py (incluyendo los timings
 via redirect_stdout durante la decodificacion y se devuelven en el
 campo "logs" de la respuesta -- tanto si la decodificacion tiene
 exito como si falla, para poder ver hasta donde llego el pipeline.
+
+--------------------------------------------------------------------
+NOTA IMPORTANTE sobre /decode y concurrencia (leer antes de tocar esto)
+--------------------------------------------------------------------
+read_camera_image_via_markers() escribe sus PNGs de debug relativos
+al directorio de trabajo actual (cwd) del proceso, no a una ruta
+absoluta. Eso significa que necesitamos aislar el cwd por request.
+
+La version anterior de este archivo resolvia esto con os.chdir() +
+un asyncio.Lock() global que serializaba TODOS los /decode entre si
+(porque os.chdir() es un estado global del PROCESO -- si dos threads
+del mismo proceso lo cambiaran en paralelo, se pisarian entre si).
+
+El problema de esa solucion: convertia cualquier decodificacion lenta
+en deuda de cola para TODAS las que llegaran despues, sin importar
+cuan simples fueran. Con varias requests encoladas, el tiempo de
+respuesta que ve el cliente pasa a ser "tiempo de cola + tiempo real
+de proceso", y el tiempo de cola crece sin limite si siguen llegando
+requests mientras la cola no se vacia -- lo que explica el sintoma de
+"las faciles tambien empiezan a demorar despues de una dificil".
+
+La solucion de raiz: en vez de compartir un unico proceso (con su
+unico cwd global) entre threads, cada decodificacion corre en su
+propio PROCESO hijo (ProcessPoolExecutor). Cada proceso tiene su
+propio cwd independiente desde que arranca, asi que no hace falta
+ningun lock -- varias decodificaciones pueden correr en paralelo de
+verdad, acotadas por la cantidad de workers del pool (ver
+DECODE_POOL_WORKERS mas abajo) en vez de por "una a la vez".
 """
 
 from __future__ import annotations
@@ -40,9 +68,12 @@ import base64
 import asyncio
 import contextlib
 import io
+import multiprocessing
+import os
 import shutil
 import tempfile
 import traceback
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -72,28 +103,73 @@ def health():
     return {"status": "ok"}
 
 
-# read_camera_image_via_markers() escribe sus PNGs de debug relativos
-# al directorio de trabajo actual (cwd), no a la carpeta del archivo
-# de entrada. os.chdir() es un estado GLOBAL del proceso, asi que dos
-# decodificaciones concurrentes pisarian el cwd una de la otra. Este
-# lock serializa /decode para que eso nunca pase (el pipeline de
-# vision por si solo ya toma un momento, asi que no es una perdida de
-# rendimiento grave para un backend de uso personal).
-_decode_lock = asyncio.Lock()
+# --------------------------------------------------------------------
+# Pool de procesos para /decode (ver nota arriba)
+# --------------------------------------------------------------------
+
+# Cuantas decodificaciones corren en paralelo como maximo. Cada worker
+# es un proceso separado que mantiene cargado cv2/numpy/etc. una vez
+# que procesa su primera tarea, asi que hay un costo de memoria fijo
+# por worker (aparte del pico durante la decodificacion en si). En una
+# instancia chica de Render (poca RAM, 1-2 vCPU compartidas) conviene
+# no poner esto igual a multiprocessing.cpu_count() a ciegas -- 2 o 3
+# suele ser un piso razonable para empezar; subilo si ves que el pool
+# se queda corto (requests encoladas con CPU disponible) y bajalo si
+# ves swapping/OOM.
+DECODE_POOL_WORKERS = min(4, multiprocessing.cpu_count())
+
+_process_pool: ProcessPoolExecutor | None = None
 
 
-class _DecodeFailure(Exception):
+def _get_process_pool() -> ProcessPoolExecutor:
+    global _process_pool
+    if _process_pool is None:
+        _process_pool = ProcessPoolExecutor(max_workers=DECODE_POOL_WORKERS)
+    return _process_pool
+
+
+def _decode_worker(workdir_str: str, input_name: str, ecc: int) -> dict:
     """
-    Envuelve cualquier excepcion lanzada dentro del pipeline de
-    decodificacion junto con los logs (stdout) capturados hasta el
-    momento del fallo, para que el endpoint pueda devolver ambos --
-    el error Y el proceso que se llego a completar -- en vez de
-    perder los logs cuando algo sale mal.
+    Corre en un PROCESO hijo separado (no un thread), asi que su cwd es
+    independiente del proceso principal y de cualquier otro worker --
+    a diferencia de la version con threads + os.chdir(), aca no hace
+    falta ningun lock: cada llamada tiene su propio cwd desde que el
+    proceso arranca, sin riesgo de que dos decodificaciones se pisen.
+
+    Devuelve siempre un dict (nunca lanza para fallos ESPERADOS del
+    pipeline, como un ValueError de decodificacion) para no depender
+    de que las excepciones se puedan pickle/despicklear correctamente
+    al cruzar el limite entre procesos -- lo cual no esta garantizado
+    para tipos de excepcion arbitrarios definidos en otros modulos.
+
+    Formato del dict:
+      exito:  {"ok": True, "text": ..., "logs": ..., "images": [...]}
+      fallo:  {"ok": False, "error_type": ..., "error_msg": ...,
+               "logs": ..., "images": [...]}
     """
-    def __init__(self, original: Exception, logs: str):
-        super().__init__(str(original))
-        self.original = original
-        self.logs = logs
+    os.chdir(workdir_str)
+    debug_image_names: list[str] = []
+    log_buffer = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(log_buffer):
+            text = read_camera_image_via_markers(
+                input_name, num_ecc_symbols=ecc, debug_images_out=debug_image_names,
+            )
+        return {
+            "ok": True,
+            "text": text,
+            "logs": log_buffer.getvalue(),
+            "images": debug_image_names,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error_type": type(exc).__name__,
+            "error_msg": str(exc),
+            "logs": log_buffer.getvalue(),
+            "images": debug_image_names,
+        }
 
 
 def _encode_debug_images(workdir: Path, filenames: list[str]) -> list[dict]:
@@ -112,37 +188,6 @@ def _encode_debug_images(workdir: Path, filenames: list[str]) -> list[dict]:
         encoded = base64.b64encode(path.read_bytes()).decode("ascii")
         images.append({"name": name, "data": f"data:image/png;base64,{encoded}"})
     return images
-
-
-def _run_decode_sync(
-    workdir: Path, input_name: str, ecc: int, debug_images_out: list,
-) -> tuple[str, str]:
-    """
-    Corre read_camera_image_via_markers() en un hilo, con el cwd
-    apuntando a `workdir` (necesario porque esa funcion escribe sus
-    PNGs de debug relativos al cwd) y capturando todo lo que imprime
-    por stdout (incluyendo los prints "[timing] ..." de diagnostico
-    de rendimiento) en un buffer, que se devuelve junto al texto
-    decodificado.
-
-    Si algo falla, se relanza como _DecodeFailure con los logs
-    capturados hasta ese punto adjuntos, para no perderlos.
-    """
-    import os
-
-    cwd_before = os.getcwd()
-    os.chdir(workdir)
-    log_buffer = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(log_buffer):
-            text = read_camera_image_via_markers(
-                input_name, num_ecc_symbols=ecc, debug_images_out=debug_images_out,
-            )
-        return text, log_buffer.getvalue()
-    except Exception as exc:
-        raise _DecodeFailure(exc, log_buffer.getvalue()) from exc
-    finally:
-        os.chdir(cwd_before)
 
 
 @app.post("/generate")
@@ -195,7 +240,8 @@ def generate(payload: dict):
 @app.post("/decode")
 async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBOLS)):
     """
-    Recibe una foto, la decodifica via read_camera_image_via_markers(),
+    Recibe una foto, la decodifica via read_camera_image_via_markers()
+    (corriendo en un proceso separado del pool -- ver _decode_worker),
     y devuelve JSON con:
       - "text": el texto decodificado (solo si tuvo exito)
       - "error": el mensaje de error (solo si fallo)
@@ -209,45 +255,52 @@ async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBO
     workdir = Path(tempfile.mkdtemp(prefix="lancherix_decode_"))
     suffix = Path(file.filename or "upload.png").suffix or ".png"
     input_path = workdir / f"input{suffix}"
-    debug_image_names: list[str] = []
 
     try:
         with open(input_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
 
-        async with _decode_lock:
-            text, logs = await asyncio.to_thread(
-                _run_decode_sync, workdir, input_path.name, ecc, debug_image_names,
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _get_process_pool(), _decode_worker, str(workdir), input_path.name, ecc,
+        )
+
+        images = _encode_debug_images(workdir, result["images"])
+
+        if result["ok"]:
+            return JSONResponse(
+                {"text": result["text"], "images": images, "logs": result["logs"]}
             )
 
-        images = _encode_debug_images(workdir, debug_image_names)
-        return JSONResponse({"text": text, "images": images, "logs": logs})
-
-    except _DecodeFailure as fail:
-        images = _encode_debug_images(workdir, debug_image_names)
-
-        if isinstance(fail.original, ValueError):
+        if result["error_type"] == "ValueError":
             return JSONResponse(
-                {"error": str(fail.original), "images": images, "logs": fail.logs},
+                {
+                    "error": result["error_msg"],
+                    "images": images,
+                    "logs": result["logs"],
+                },
                 status_code=422,
             )
 
-        traceback.print_exc()
+        print(
+            f"[decode] error interno ({result['error_type']}): {result['error_msg']}"
+        )
         return JSONResponse(
             {
-                "error": f"Error interno al decodificar: {fail.original}",
+                "error": f"Error interno al decodificar: {result['error_msg']}",
                 "images": images,
-                "logs": fail.logs,
+                "logs": result["logs"],
             },
             status_code=500,
         )
 
     except Exception as exc:
         # Fallo fuera del pipeline de decodificacion en si (por
-        # ejemplo, al guardar el archivo subido) -- no hay logs de
-        # _run_decode_sync que adjuntar en este caso.
+        # ejemplo, al guardar el archivo subido, o al comunicarse con
+        # el proceso del pool) -- no hay "logs" del pipeline interno
+        # que adjuntar en este caso.
         traceback.print_exc()
-        images = _encode_debug_images(workdir, debug_image_names)
+        images = _encode_debug_images(workdir, [])
         return JSONResponse(
             {"error": f"Error interno al decodificar: {exc}", "images": images},
             status_code=500,
@@ -259,7 +312,6 @@ async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBO
 
 if __name__ == "__main__":
     import uvicorn
-    import os
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
