@@ -16,7 +16,8 @@ Endpoints:
 
   POST /decode
       multipart/form-data: file=<imagen> , ecc=<int opcional>
-      -> devuelve JSON: {"text": "..."} o {"error": "..."}
+      -> devuelve JSON: {"text": "...", "images": [...], "logs": "..."}
+         o {"error": "...", "images": [...], "logs": "..."}
 
   GET /health
       -> {"status": "ok"}  (util para el health check de Render)
@@ -25,12 +26,20 @@ Cada request corre en su propio directorio temporal, asi los archivos
 de debug que generan lancherix_camera_reader.py / lancherix_generator.py
 (png intermedios) no chocan entre pedidos concurrentes ni se acumulan
 en el filesystem del backend.
+
+Los prints de lancherix_camera_reader.py (incluyendo los timings
+"[timing] ..." agregados para diagnosticar rendimiento) se capturan
+via redirect_stdout durante la decodificacion y se devuelven en el
+campo "logs" de la respuesta -- tanto si la decodificacion tiene
+exito como si falla, para poder ver hasta donde llego el pipeline.
 """
 
 from __future__ import annotations
 
 import base64
 import asyncio
+import contextlib
+import io
 import shutil
 import tempfile
 import traceback
@@ -73,15 +82,18 @@ def health():
 _decode_lock = asyncio.Lock()
 
 
-def _run_decode_sync(workdir: Path, input_name: str, ecc: int) -> str:
-    import os
-
-    cwd_before = os.getcwd()
-    os.chdir(workdir)
-    try:
-        return read_camera_image_via_markers(input_name, num_ecc_symbols=ecc)
-    finally:
-        os.chdir(cwd_before)
+class _DecodeFailure(Exception):
+    """
+    Envuelve cualquier excepcion lanzada dentro del pipeline de
+    decodificacion junto con los logs (stdout) capturados hasta el
+    momento del fallo, para que el endpoint pueda devolver ambos --
+    el error Y el proceso que se llego a completar -- en vez de
+    perder los logs cuando algo sale mal.
+    """
+    def __init__(self, original: Exception, logs: str):
+        super().__init__(str(original))
+        self.original = original
+        self.logs = logs
 
 
 def _encode_debug_images(workdir: Path, filenames: list[str]) -> list[dict]:
@@ -104,15 +116,31 @@ def _encode_debug_images(workdir: Path, filenames: list[str]) -> list[dict]:
 
 def _run_decode_sync(
     workdir: Path, input_name: str, ecc: int, debug_images_out: list,
-) -> str:
+) -> tuple[str, str]:
+    """
+    Corre read_camera_image_via_markers() en un hilo, con el cwd
+    apuntando a `workdir` (necesario porque esa funcion escribe sus
+    PNGs de debug relativos al cwd) y capturando todo lo que imprime
+    por stdout (incluyendo los prints "[timing] ..." de diagnostico
+    de rendimiento) en un buffer, que se devuelve junto al texto
+    decodificado.
+
+    Si algo falla, se relanza como _DecodeFailure con los logs
+    capturados hasta ese punto adjuntos, para no perderlos.
+    """
     import os
 
     cwd_before = os.getcwd()
     os.chdir(workdir)
+    log_buffer = io.StringIO()
     try:
-        return read_camera_image_via_markers(
-            input_name, num_ecc_symbols=ecc, debug_images_out=debug_images_out,
-        )
+        with contextlib.redirect_stdout(log_buffer):
+            text = read_camera_image_via_markers(
+                input_name, num_ecc_symbols=ecc, debug_images_out=debug_images_out,
+            )
+        return text, log_buffer.getvalue()
+    except Exception as exc:
+        raise _DecodeFailure(exc, log_buffer.getvalue()) from exc
     finally:
         os.chdir(cwd_before)
 
@@ -163,12 +191,20 @@ def generate(payload: dict):
         background=BackgroundTask(shutil.rmtree, str(workdir), ignore_errors=True),
     )
 
+
 @app.post("/decode")
 async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBOLS)):
     """
-    ... (docstring igual, se puede agregar una linea mencionando que
-    la respuesta incluye "images": [...] con las fotos de debug
-    generadas, incluso si hay error) ...
+    Recibe una foto, la decodifica via read_camera_image_via_markers(),
+    y devuelve JSON con:
+      - "text": el texto decodificado (solo si tuvo exito)
+      - "error": el mensaje de error (solo si fallo)
+      - "images": las fotos de debug generadas por el pipeline (se
+        incluyen aunque haya habido un error, hasta donde se haya
+        llegado)
+      - "logs": todo lo que el pipeline imprimio por stdout durante
+        la decodificacion (incluyendo los timings "[timing] ..."),
+        tanto si tuvo exito como si fallo
     """
     workdir = Path(tempfile.mkdtemp(prefix="lancherix_decode_"))
     suffix = Path(file.filename or "upload.png").suffix or ".png"
@@ -180,20 +216,36 @@ async def decode(file: UploadFile = File(...), ecc: int = Form(DEFAULT_ECC_SYMBO
             shutil.copyfileobj(file.file, f)
 
         async with _decode_lock:
-            text = await asyncio.to_thread(
+            text, logs = await asyncio.to_thread(
                 _run_decode_sync, workdir, input_path.name, ecc, debug_image_names,
             )
 
         images = _encode_debug_images(workdir, debug_image_names)
-        return JSONResponse({"text": text, "images": images})
+        return JSONResponse({"text": text, "images": images, "logs": logs})
 
-    except ValueError as exc:
+    except _DecodeFailure as fail:
         images = _encode_debug_images(workdir, debug_image_names)
+
+        if isinstance(fail.original, ValueError):
+            return JSONResponse(
+                {"error": str(fail.original), "images": images, "logs": fail.logs},
+                status_code=422,
+            )
+
+        traceback.print_exc()
         return JSONResponse(
-            {"error": str(exc), "images": images}, status_code=422,
+            {
+                "error": f"Error interno al decodificar: {fail.original}",
+                "images": images,
+                "logs": fail.logs,
+            },
+            status_code=500,
         )
 
     except Exception as exc:
+        # Fallo fuera del pipeline de decodificacion en si (por
+        # ejemplo, al guardar el archivo subido) -- no hay logs de
+        # _run_decode_sync que adjuntar en este caso.
         traceback.print_exc()
         images = _encode_debug_images(workdir, debug_image_names)
         return JSONResponse(

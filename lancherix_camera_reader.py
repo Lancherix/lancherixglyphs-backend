@@ -59,11 +59,20 @@ Ahora sigue el flujo de lancherix_shapes.py:
 `num_ecc_symbols` debe ser el MISMO valor usado al generar el codigo
 (DEFAULT_ECC_SYMBOLS de lancherix_shapes.py, salvo que el generador
 se haya invocado con un valor distinto explicito).
+
+CAMBIO (diagnostico de rendimiento en produccion):
+
+Se agrego un paso de downscale de la imagen de entrada
+(_downscale_if_needed) antes de cualquier procesamiento, y prints de
+timing (_lap) en cada fase, para poder ver -- via los logs devueltos
+por el backend -- en que fase se esta yendo el tiempo cuando el
+pipeline corre mucho mas lento en produccion que en local.
 """
 
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -106,6 +115,33 @@ from lancherix_corner_rectifier_4markers import (
 # -- se pasa explicitamente a _resolve_background_foreground para
 # que el template matching interno use el mismo tamano.
 _TEMPLATE_SIZE = 40
+
+# Dimension maxima (lado mas largo, en px) que se le permite tener a
+# la imagen de entrada antes de procesarla. Fotos de camara/celular
+# suelen venir en 3000-4000px+ de lado, mucho mas resolucion de la
+# que necesita la deteccion de corner markers y lineas Hough; bajar
+# la resolucion ANTES de todo el pipeline reduce el costo de cada
+# fase (aprox. proporcional a la cantidad de pixeles) sin perder
+# precision util para la deteccion. Ajustar este valor si algun caso
+# real deja de decodificar de forma confiable.
+_MAX_INPUT_DIMENSION = 1600
+
+
+def _downscale_if_needed(image: np.ndarray, max_dim: int = _MAX_INPUT_DIMENSION) -> np.ndarray:
+    """
+    Si el lado mas largo de `image` supera `max_dim`, la reescala
+    (INTER_AREA, adecuado para reducir tamano) manteniendo la
+    proporcion. Si ya es igual o mas chica, la devuelve sin tocar.
+    """
+    h, w = image.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return image
+    scale = max_dim / float(longest)
+    return cv2.resize(
+        image, (int(round(w * scale)), int(round(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -183,6 +219,7 @@ def _map_points_through_inverse_homography(points_dict, H):
     mapped = cv2.perspectiveTransform(pts, H_inv).reshape(-1, 2)
     return {label: tuple(point) for label, point in zip(labels, mapped)}
 
+
 def read_camera_image_via_markers(
     image_path: str,
     num_ecc_symbols: int = DEFAULT_ECC_SYMBOLS,
@@ -226,13 +263,25 @@ def read_camera_image_via_markers(
     Guarda en disco PNGs de debug (`_quad.png` con las lineas Hough y
     el quad exacto, `_rectified.png`, `_grid.png` con la cuadricula
     deducida), mas un canvas canonico final
-    (`_k{k}_canonical_via_markers.png`).
+    (`_k{k}_canonical_via_markers.png`). Ademas imprime, en cada fase,
+    el tiempo transcurrido desde el inicio de la funcion (`[timing]`),
+    para poder diagnosticar en que fase se concentra el tiempo cuando
+    el pipeline corre en un entorno mas lento que el local.
     """
     if debug_images_out is None:
         debug_images_out = []
+
+    _t_start = time.perf_counter()
+
+    def _lap(label: str) -> None:
+        print(f"[timing] {label}: {time.perf_counter() - _t_start:.2f}s elapsed")
+
     image = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f"No se pudo abrir la imagen: {image_path}")
+
+    image = _downscale_if_needed(image)
+    _lap("after load + downscale")
 
     # Aplica el efecto scanner (blancos/negros puros) directo sobre la
     # foto original, sin necesidad de un archivo intermedio en disco.
@@ -243,6 +292,7 @@ def read_camera_image_via_markers(
         image = scanned.copy()
     cv2.imwrite(f"{Path(image_path).stem}_scanner.png", scanned)
     debug_images_out.append(f"{Path(image_path).stem}_scanner.png")
+    _lap("after scanner effect")
 
     # ------------------------------------------------------------------
     # FASE 1 -- candidatos y cuadrilatero aproximado (TL/TR/BR/BL).
@@ -257,6 +307,7 @@ def read_camera_image_via_markers(
         )
 
     marker_results = build_marker_results(best_quad)
+    _lap("after corner marker detection")
 
     # ------------------------------------------------------------------
     # FASE 2 -- clasificacion largo/corto (resuelve 90/270) + warp de
@@ -283,6 +334,7 @@ def read_camera_image_via_markers(
     print("QUAD IMAGE SAVED")
     print("----------------")
     print(quad_debug_path)
+    _lap("after whole-image warp")
 
     rectified_debug_path = f"{input_name}_rectified.png"
     cv2.imwrite(rectified_debug_path, warp_info["warped"])
@@ -310,6 +362,7 @@ def read_camera_image_via_markers(
     print()
     print(f"k = {k} (estimado {k_info['k_float']:.3f})")
     print(f"modulo estimado = {avg_module_size:.2f}px")
+    _lap("after k computation")
 
     # ------------------------------------------------------------------
     # FASE 4 -- rectangulo exterior real del codigo + recorte, sobre el
@@ -331,6 +384,7 @@ def read_camera_image_via_markers(
     print("GRID IMAGE SAVED")
     print("----------------")
     print(grid_debug_path)
+    _lap("after crop + grid")
 
     # ------------------------------------------------------------------
     # FASE 5 -- ambiguedad de 180 grados. Aca NO rotamos pixels: en vez
@@ -375,9 +429,10 @@ def read_camera_image_via_markers(
         corners = outer_points_original
 
     print(f"  rotacion aplicada (via emparejamiento de esquinas)={rotation_needed}")
+    _lap("after orientation correction")
 
     row_width = GRID_ASPECT_RATIO * k
-    
+
     # ------------------------------------------------------------------
     # Warp FINAL directo: imagen original -> canvas canonico CON quiet
     # zone (mismo formato que espera _decode_canonical_image), en un
@@ -422,6 +477,7 @@ def read_camera_image_via_markers(
     print("CANONICAL IMAGE SAVED (via corner markers)")
     print("-------------------------------------------")
     print(canonical_path)
+    _lap("after final warp")
 
     canonical_rgb = cv2.cvtColor(canonical_bgr, cv2.COLOR_BGR2RGB)
 
@@ -431,6 +487,7 @@ def read_camera_image_via_markers(
 
     print()
     print(f"k = {k}")
+    _lap("after decode (total)")
 
     return text
 
