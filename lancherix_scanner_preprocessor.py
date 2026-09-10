@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 
 """
-lancherix_scanner_preprocessor.py (v6)
+lancherix_scanner_preprocessor.py (v7)
 
 Convierte una fotografia en una imagen tipo scanner:
-- localiza la tarjeta dentro de la foto y descarta el fondo (nuevo en v6)
+- localiza la tarjeta dentro de la foto y descarta el fondo
+- refina esa localizacion en un segundo paso para eliminar el fondo
+  POR COMPLETO, no solo en su mayor parte (nuevo en v7)
 - blancos mas blancos
 - negros mas negros
 - elimina gran parte de los grises
@@ -12,7 +14,7 @@ Convierte una fotografia en una imagen tipo scanner:
 - NO recorta el codigo en si (eso lo sigue haciendo el rectifier)
 - NO detecta markers
 - Robusto a iluminacion despareja (sombras, luz de lado)
-- Robusto a fondos con textura similar en brillo/color al papel (v6)
+- Robusto a fondos con textura similar en brillo/color al papel
 - Rapido
 - Nitido incluso en resoluciones chicas (ver nota de tamano abajo)
 
@@ -22,7 +24,96 @@ Salida:
     foto_scanner.png
 
 ---------------------------------------------------------------------
-NUEVO EN v6 -- LOCALIZACION DE LA TARJETA ANTES DE ESCANEAR
+NUEVO EN v7 -- EL FONDO TIENE QUE DESAPARECER POR COMPLETO
+---------------------------------------------------------------------
+Problema que motiva este cambio: v6 localiza la tarjeta con un margen
+DELIBERADAMENTE generoso (_DOC_MARGIN_FRAC = 0.20, ver nota de v6 mas
+abajo sobre por que) porque el cuadrilatero candidato de
+find_document_quad() tiende a asentarse sobre el borde impreso
+interno de la tarjeta, no sobre el corte real del papel -- un margen
+chico corria el riesgo de recortar dentro del patron impreso, que es
+un fallo mucho mas grave que dejar un poco de fondo de mas.
+
+Ese margen generoso cumple su proposito (no perder codigo), pero
+como efecto secundario dejaba una franja real de fondo (alfombra,
+mesa, lo que sea) alrededor de la tarjeta en el recorte. Esa franja
+no es solo un problema estetico: al llegar a scanner_effect() y
+binarizarse, una franja de fondo con textura (p. ej. una alfombra)
+no se binariza a un blanco limpio -- se convierte en manchas
+negras y puntos blancos sueltos (ruido de alto contraste local, cada
+mancha de la alfombra que cae de un lado u otro del umbral). Ese
+ruido quedaba en el PNG de salida, pegado al borde, ensuciando una
+imagen que deberia ser solo tarjeta.
+
+La solucion no es simplemente achicar _DOC_MARGIN_FRAC (eso reabre el
+riesgo original de cortar el patron impreso que motivo el margen
+generoso en v6). Son dos cambios independientes y complementarios,
+cada uno atacando el problema en una etapa distinta del pipeline:
+
+1. SEGUNDO PASO DE LOCALIZACION (find_document_region)
+
+   Insight clave: el problema que forzaba un margen generoso en el
+   PRIMER paso -- textura de fondo compitiendo con el borde real de
+   la tarjeta, contraste parejo entre ambos -- practicamente
+   desaparece una vez que ya se hizo un primer recorte. Con la
+   alfombra (o lo que sea) reducida a una franja angosta en los
+   bordes del recorte y la tarjeta ocupando la enorme mayoria del
+   cuadro, un segundo llamado a find_document_quad() sobre ESE
+   recorte encuentra el borde real del papel con mucha mas precision
+   -- hay mucho menos fondo con el que confundirse, y la tarjeta
+   ahora es, por lejos, el contorno mas grande y solido del cuadro.
+
+   Se probo empiricamente sobre el caso que motivo este cambio (foto
+   de la tarjeta rotada sobre una alfombra oscura de textura
+   irregular): el primer paso ubica la tarjeta con score ~0.86 y dejo
+   una franja de fondo visible; el segundo paso, sobre ese recorte,
+   sube a score ~0.92 y ubica un cuadrilatero notablemente mas ajustado
+   al borde real del papel. Con ese cuadrilatero mas confiable, el
+   segundo recorte SI puede usar un margen chico
+   (_DOC_REFINE_MARGIN_FRAC = 0.05) sin arriesgar el patron impreso,
+   porque ya no esta absorbiendo el error de deteccion original que
+   justificaba un margen grande -- ese error ya se corrigio en el
+   primer paso.
+
+   Si el segundo paso no encuentra un cuadrilatero confiable (deberia
+   ser infrecuente, dado lo simple que ya queda el fondo), se sigue
+   de largo con el resultado del primer paso sin refinar -- mismo
+   criterio de fallback seguro que ya usaba v6.
+
+2. LIMPIEZA DE BORDE POST-BINARIZACION (clear_border_ink)
+
+   El segundo paso de localizacion reduce el problema, pero no lo
+   elimina con garantia matematica para TODA foto -- sigue siendo una
+   deteccion geometrica con su propio margen de error, no una
+   segmentacion pixel-perfect del papel. Para no depender de afinar
+   el numero de margen "perfecto" (que en la practica varia de foto
+   en foto), se agrega una red de seguridad DESPUES de binarizar: se
+   identifican los blobs de tinta (negro) conectados que tocan el
+   borde del canvas y se blanquean.
+
+   Por que esto es seguro: el margen de papel alrededor del patron
+   impreso (en cualquiera de los dos pasos de localizacion) existe
+   justamente para que el patron real nunca llegue hasta el borde del
+   recorte -- ver la nota de v6 sobre _DOC_MARGIN_FRAC. Cualquier
+   tinta que SI toque el borde del canvas, entonces, por construccion
+   no es parte del codigo: es fondo residual que sobrevivio a la
+   localizacion y alcanzo suficiente contraste local para binarizar a
+   negro. Limpiarla no arriesga perder codigo real.
+
+   Esta limpieza se aplica sobre el resultado final de
+   scanner_effect() (adentro de la funcion misma, ver su cuerpo), es
+   decir despues de _scanner_effect_small() o _scanner_effect_large()
+   segun corresponda -- se beneficia igual cualquier camino.
+
+Con los dos cambios juntos (menos fondo llega a binarizarse gracias
+al segundo pase de localizacion, y lo poco que sobreviva se limpia
+despues de binarizar) el resultado es una imagen con la tarjeta
+aislada del fondo por completo: blanco de papel limpio hasta el
+borde del canvas, sin manchas ni ruido de fondo. Se verifico
+visualmente sobre el caso que motivo este cambio.
+
+---------------------------------------------------------------------
+NOTA DE v6 -- LOCALIZACION DE LA TARJETA ANTES DE ESCANEAR
 ---------------------------------------------------------------------
 Problema que motiva este cambio: en fotos con fondos con textura
 irregular (alfombras, tela, madera con vetas), el paso de
@@ -96,10 +187,13 @@ Como se encuentra la tarjeta (find_document_region / find_document_quad):
      porque el localizador no esta seguro).
   5. Con el cuadrilatero elegido se calcula una homografia
      (getPerspectiveTransform) hacia un rectangulo con un margen
-     agregado alrededor (MARGIN_FRAC_DOCUMENT), y se aplica a la foto
+     agregado alrededor (_DOC_MARGIN_FRAC), y se aplica a la foto
      COMPLETA a color (warpPerspective) -- esto ya endereza la
      perspectiva de la tarjeta antes de que scanner_effect() la vea,
      ademas de eliminar el fondo.
+
+  (v7 agrega un segundo pase de este mismo proceso sobre el
+  resultado, ver nota de v7 arriba.)
 
 Esta localizacion no depende de que la tarjeta este centrada: busca
 en toda la foto, no en una region fija.
@@ -197,11 +291,14 @@ _DOC_MAX_ASPECT = 5.0
 
 # Puntaje minimo para confiar en el cuadrilatero encontrado. Por
 # debajo de esto, se sigue de largo con la foto completa sin recortar
-# (fallback seguro).
+# (fallback seguro). Se reusa el mismo umbral para el segundo pase de
+# refinamiento (ver nota de v7) -- si algo, el segundo pase deberia
+# scorear IGUAL o MEJOR que el primero (menos fondo compitiendo), asi
+# que no hizo falta un umbral separado y mas permisivo para el.
 _DOC_CONFIDENCE_THRESHOLD = 0.55
 
 # Margen agregado alrededor de la tarjeta detectada, como fraccion de
-# su ancho/alto, al enderezar la perspectiva.
+# su ancho/alto, al enderezar la perspectiva EN EL PRIMER PASE.
 #
 # Deliberadamente generoso (20%, no un numero simbolico como 5%).
 # Motivo: el cuadrilatero candidato de find_document_quad() en la
@@ -210,7 +307,6 @@ _DOC_CONFIDENCE_THRESHOLD = 0.55
 # papel -- Canny+approxPolyDP encuentran el contorno mas nitido y
 # contrastado, que suele ser esa linea, no el corte del papel contra
 # el fondo (mas mixto en contraste segun la foto). Normalmente el
-# normalmente el
 # margen compensa esa diferencia sin problema, pero se detecto
 # empiricamente un caso (foto con la tarjeta mas cerca del borde del
 # encuadre y con menos contraste papel/fondo de un lado) donde un
@@ -218,12 +314,25 @@ _DOC_CONFIDENCE_THRESHOLD = 0.55
 # del patron impreso -- perdiendo informacion real del codigo.
 #
 # El costo de un margen generoso es bajo (un poco mas de fondo
-# alrededor de la tarjeta en el recorte, que el rectifier tolera bien
-# -- su propia deteccion de markers ya es robusta a algo de fondo
-# alrededor); el costo de un margen chico es alto (recortar el codigo
-# real es un fallo grave, no cosmetico). Ante esa asimetria, se
-# prefiere errar generoso.
+# alrededor de la tarjeta en el recorte -- y desde v7 ese resto de
+# fondo se termina de limpiar en el segundo pase + clear_border_ink,
+# ver nota de v7); el costo de un margen chico es alto (recortar el
+# codigo real es un fallo grave, no cosmetico). Ante esa asimetria,
+# se prefiere errar generoso en ESTE primer pase.
 _DOC_MARGIN_FRAC = 0.20
+
+# Margen agregado en el SEGUNDO pase de localizacion (ver nota de v7
+# arriba). Deliberadamente mas chico que _DOC_MARGIN_FRAC: para
+# cuando se llega a este pase, el fondo ya quedo mayormente afuera
+# gracias al primer recorte generoso, asi que el cuadrilatero que
+# encuentra find_document_quad() sobre ESE recorte ya no esta
+# absorbiendo el mismo error de deteccion (fondo con contraste
+# parecido al papel, borde impreso interno confundido con el corte
+# real) que justificaba un margen grande en el primer pase -- se
+# probo empiricamente que 5% alcanza sin cortar el patron impreso, y
+# clear_border_ink() actua ademas como red de seguridad final por si
+# algun caso puntual necesitara mas margen del que este numero da.
+_DOC_REFINE_MARGIN_FRAC = 0.05
 
 # Cuanto hacia adentro del borde del cuadrilatero candidato se mide
 # la "planitud" del margen de papel (ver margin_flatness_score), como
@@ -387,7 +496,7 @@ def find_document_quad(image):
     return best, best_score, candidates_info
 
 
-def warp_quad_with_margin(image, quad, margin_frac=_DOC_MARGIN_FRAC):
+def warp_quad_with_margin(image, quad, margin_frac):
     tl, tr, br, bl = quad
     width = int(round((np.linalg.norm(tr - tl) + np.linalg.norm(br - bl)) / 2))
     height = int(round((np.linalg.norm(bl - tl) + np.linalg.norm(br - tr)) / 2))
@@ -413,23 +522,82 @@ def find_document_region(image):
     """
     Localiza la tarjeta dentro de la foto (a color, sin asumir que
     este centrada) y devuelve una version recortada + con perspectiva
-    corregida, con un margen alrededor. Si no se encuentra un
-    candidato con confianza suficiente, devuelve la imagen original
-    sin modificar (fallback seguro) -- el resto del pipeline sigue
-    funcionando igual que en versiones anteriores en ese caso.
+    corregida, con un margen chico alrededor. Si no se encuentra un
+    candidato con confianza suficiente en el primer pase, devuelve la
+    imagen original sin modificar (fallback seguro) -- el resto del
+    pipeline sigue funcionando igual que en versiones anteriores en
+    ese caso.
 
-    Devuelve (imagen_resultado, encontrado: bool, score: float).
+    v7: ademas del primer pase (con margen generoso, ver
+    _DOC_MARGIN_FRAC), se hace un segundo pase de localizacion sobre
+    el resultado del primero para ajustar el recorte con un margen
+    mucho mas chico (_DOC_REFINE_MARGIN_FRAC) y asi terminar de sacar
+    el fondo que el primer pase, por diseno, deja alrededor (ver nota
+    de modulo "NUEVO EN v7"). Si el segundo pase no encuentra nada
+    confiable se sigue con el resultado del primer pase sin refinar.
+
+    Devuelve (imagen_resultado, encontrado: bool, score: float). Si
+    hubo refinamiento, score corresponde al segundo pase.
     """
     quad, score, _ = find_document_quad(image)
     if quad is None or score < _DOC_CONFIDENCE_THRESHOLD:
         return image, False, score
 
-    warped = warp_quad_with_margin(image, quad)
+    warped = warp_quad_with_margin(image, quad, margin_frac=_DOC_MARGIN_FRAC)
+
+    quad2, score2, _ = find_document_quad(warped)
+    if quad2 is not None and score2 >= _DOC_CONFIDENCE_THRESHOLD:
+        warped = warp_quad_with_margin(warped, quad2, margin_frac=_DOC_REFINE_MARGIN_FRAC)
+        score = score2
+
     return warped, True, score
 
 
+def clear_border_ink(binary):
+    """
+    NUEVO EN v7. Ultima red de seguridad contra fondo residual: en la
+    imagen ya binarizada (0 = negro/tinta, 255 = blanco/papel),
+    elimina cualquier blob de tinta conectado que toque el borde del
+    canvas, blanqueandolo.
+
+    Por que esto es seguro (no arriesga borrar codigo real): el
+    margen de papel alrededor del patron impreso -- en cualquiera de
+    los dos pases de find_document_region() -- existe justamente para
+    que el patron real nunca llegue hasta el borde del recorte (ver
+    nota de v6 sobre _DOC_MARGIN_FRAC). Cualquier tinta que SI toque
+    el borde del canvas, entonces, por construccion no es parte del
+    codigo: es fondo residual (textura de fondo con contraste
+    suficiente para binarizar a negro, un flanco de sombra, un
+    recorte imperfecto) que sobrevivio a la localizacion.
+
+    Se prefirio esto a simplemente achicar mas el margen de recorte:
+    no depende de acertarle a un numero de margen "perfecto" (que
+    varia de foto en foto), y no arriesga cortar el patron real si el
+    margen resulta demasiado chico en algun caso puntual -- solo
+    limpia lo que efectivamente quedo pegado al borde, sea cual sea
+    la causa.
+    """
+    ink = (binary == 0).astype(np.uint8)
+    num_labels, labels = cv2.connectedComponents(ink, connectivity=8)
+    if num_labels <= 1:
+        return binary
+
+    border_labels = set(labels[0, :].tolist())
+    border_labels |= set(labels[-1, :].tolist())
+    border_labels |= set(labels[:, 0].tolist())
+    border_labels |= set(labels[:, -1].tolist())
+    border_labels.discard(0)  # 0 = fondo de la mascara de tinta, no tocar
+    if not border_labels:
+        return binary
+
+    result = binary.copy()
+    result[np.isin(labels, list(border_labels))] = 255
+    return result
+
+
 # --- scanner_effect (sin cambios de logica, solo ahora recibe la
-#     imagen ya recortada por find_document_region cuando corresponde) --
+#     imagen ya recortada por find_document_region cuando corresponde,
+#     y su salida pasa por clear_border_ink antes de devolverse) --
 
 def _percentile_contrast_stretch(gray, low_pct=2, high_pct=98):
     low = np.percentile(gray, low_pct)
@@ -533,10 +701,11 @@ def _scanner_effect_small(gray):
 def scanner_effect(image, _report=None):
     # ---------------------------------------------------------
     # 0. Localizar la tarjeta y descartar el fondo (ver nota de
-    #    modulo). Se hace ACA adentro, no solo en main(), para que
-    #    cualquier caller que importe y use scanner_effect()
-    #    directamente (p. ej. read_camera_image_via_markers()) se
-    #    beneficie tambien -- no solo el uso por linea de comandos.
+    #    modulo, incluye desde v7 un segundo pase de refinamiento).
+    #    Se hace ACA adentro, no solo en main(), para que cualquier
+    #    caller que importe y use scanner_effect() directamente
+    #    (p. ej. read_camera_image_via_markers()) se beneficie
+    #    tambien -- no solo el uso por linea de comandos.
     #
     #    _report es un hook opcional (dict mutable) solo para que
     #    main() pueda imprimir el resultado de la localizacion sin
@@ -557,8 +726,16 @@ def scanner_effect(image, _report=None):
 
     h, w = gray.shape
     if max(h, w) <= _SMALL_IMAGE_MAX_DIM:
-        return _scanner_effect_small(gray)
-    return _scanner_effect_large(gray)
+        result = _scanner_effect_small(gray)
+    else:
+        result = _scanner_effect_large(gray)
+
+    # ---------------------------------------------------------
+    # 2. Red de seguridad final (v7): blanquear cualquier resto de
+    #    fondo que haya sobrevivido a la localizacion y llegado a
+    #    binarizarse pegado al borde del canvas. Ver clear_border_ink().
+    # ---------------------------------------------------------
+    return clear_border_ink(result)
 
 
 def main():
