@@ -121,18 +121,23 @@ DECODE_POOL_WORKERS = min(4, multiprocessing.cpu_count())
 _process_pool: ProcessPoolExecutor | None = None
 
 
+def _warmup_noop() -> None:
+    """Trivial task submitted to each pool worker on startup just to
+    force it to spawn/fork now, instead of on the first real request."""
+    return None
+
+
 def _get_process_pool() -> ProcessPoolExecutor:
     global _process_pool
     if _process_pool is None:
-        ctx = multiprocessing.get_context("fork")
-        _process_pool = ProcessPoolExecutor(max_workers=DECODE_POOL_WORKERS, mp_context=ctx)
+        _process_pool = ProcessPoolExecutor(max_workers=DECODE_POOL_WORKERS)
     return _process_pool
 
 
 @app.on_event("startup")
 def _warm_process_pool():
     pool = _get_process_pool()
-    futures = [pool.submit(lambda: None) for _ in range(DECODE_POOL_WORKERS)]
+    futures = [pool.submit(_warmup_noop) for _ in range(DECODE_POOL_WORKERS)]
     for f in futures:
         f.result()
 
