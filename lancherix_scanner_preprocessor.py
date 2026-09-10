@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 
 """
-lancherix_scanner_preprocessor.py (v6)
+lancherix_scanner_preprocessor.py (v7)
 
 Convierte una fotografia en una imagen tipo scanner:
-- localiza la tarjeta dentro de la foto y descarta el fondo (nuevo en v6)
+- localiza la tarjeta dentro de la foto y descarta el fondo
+- recorta AJUSTADO a la tarjeta cuando la deteccion es confiable (nuevo en v7)
 - blancos mas blancos
 - negros mas negros
 - elimina gran parte de los grises
@@ -12,7 +13,7 @@ Convierte una fotografia en una imagen tipo scanner:
 - NO recorta el codigo en si (eso lo sigue haciendo el rectifier)
 - NO detecta markers
 - Robusto a iluminacion despareja (sombras, luz de lado)
-- Robusto a fondos con textura similar en brillo/color al papel (v6)
+- Robusto a fondos con textura similar en brillo/color al papel
 - Rapido
 - Nitido incluso en resoluciones chicas (ver nota de tamano abajo)
 
@@ -22,7 +23,74 @@ Salida:
     foto_scanner.png
 
 ---------------------------------------------------------------------
-NUEVO EN v6 -- LOCALIZACION DE LA TARJETA ANTES DE ESCANEAR
+NUEVO EN v7 -- DOS BUGS QUE HACIAN QUE EL RECORTE SALIERA MAL
+---------------------------------------------------------------------
+v6 ya intentaba localizar la tarjeta y descartar el fondo antes de
+escanear (ver nota de v6 mas abajo, que sigue vigente). En la
+practica, sin embargo, el recorte fallaba de dos maneras distintas
+segun la foto:
+
+  (a) A veces no recortaba nada -- el score del mejor candidato
+      quedaba por debajo de _DOC_CONFIDENCE_THRESHOLD y el pipeline
+      caia al fallback seguro (foto completa sin recortar), aunque el
+      candidato correcto SI estuviera entre los encontrados y con muy
+      buena forma (rect_fill cerca de 1.0, aspect razonable).
+
+  (b) Cuando si recortaba, el recorte final dejaba una franja ancha
+      de fondo (alfombra, tela, etc.) alrededor de la tarjeta, que
+      scanner_effect() despues binariza en manchas/ruido tipo
+      sal-y-pimienta -- justo el tipo de ruido que confunde al lector
+      de markers en el siguiente paso.
+
+Causa de (a): la formula de "solidity" (ver find_document_quad)
+usaba el AREA DEL CONTORNO CRUDO de Canny (cv2.contourArea(c)) contra
+el area de su hull convexo. El problema es que el contorno crudo,
+despues de dilate+erode, suele ser un ANILLO delgado que sigue el
+borde de la tarjeta -- no un blob relleno. Un anillo delgado tiene un
+area encerrada minuscula comparada con el area de su propio hull
+convexo (que si es, practicamente, el rectangulo completo de la
+tarjeta), aunque el candidato sea geometricamente perfecto. Se
+confirmo empiricamente sobre una foto real: un candidato con
+rect_fill=0.999 (cuadrilatero casi perfecto) y aspect=2.74 (correcto
+para la tarjeta) tenia solidity=0.071 con la formula vieja -- eso por
+si solo hundia el score final muy por debajo del umbral, a pesar de
+ser, con diferencia, el mejor candidato entre los que se encontraron.
+
+Arreglo: solidity ahora se calcula como
+  area del CUADRILATERO YA AJUSTADO (quad, el resultado de
+  approxPolyDP) / area del hull convexo
+en lugar de area del contorno crudo / area del hull convexo. Mide lo
+mismo que se queria medir originalmente (es esto un blob solido o una
+forma irregular/dispersa) pero sin dejarse enganar por contornos en
+forma de anillo. Sobre la misma foto de prueba, el candidato correcto
+paso de solidity=0.071 a solidity=0.939, y el score total de
+0.422 (por debajo del umbral 0.55, fallback a foto completa) a 0.639
+(por encima, recorte correcto). El resto de la formula de score no
+cambio.
+
+Causa de (b): _DOC_MARGIN_FRAC=0.20 era un margen fijo, pensado como
+salvavidas para el caso en que el cuadrilatero detectado se hubiera
+asentado sobre el borde impreso interno de la tarjeta en vez del
+borde real del papel (ver nota de v6 sobre _DOC_MARGIN_FRAC -- ese
+razonamiento sigue siendo valido para candidatos de confianza baja o
+media). Pero aplicarlo siempre, incluso cuando el candidato tiene
+rect_fill, flatness Y (ahora) solidity todos altos -- es decir, un
+ajuste casi perfecto sobre el borde real -- solo suma fondo de mas
+que terminaba convertido en ruido.
+
+Arreglo: margin_frac_for_score() interpola el margen segun el score
+de confianza del candidato: cerca de _DOC_CONFIDENCE_THRESHOLD se
+mantiene el margen generoso de siempre (0.20, mismo salvavidas de
+v6); en el extremo de alta confianza (score >= 0.85) el margen baja a
+0.06. Un candidato de confianza intermedia obtiene un margen
+intermedio. Esto no reduce la robustez para los casos dificiles (el
+margen generoso se sigue usando ahi) pero deja un recorte mucho mas
+ajustado -- y con muchisimo menos ruido despues de binarizar -- en el
+caso comun de una foto bien tomada, con buena luz y la tarjeta mas o
+menos de frente.
+
+---------------------------------------------------------------------
+NOTA DE v6 -- LOCALIZACION DE LA TARJETA ANTES DE ESCANEAR
 ---------------------------------------------------------------------
 Problema que motiva este cambio: en fotos con fondos con textura
 irregular (alfombras, tela, madera con vetas), el paso de
@@ -49,9 +117,11 @@ Como se encuentra la tarjeta (find_document_region / find_document_quad):
      imagen -- es un cuadrilatero irregular. Forzar un rectangulo
      rotado (minAreaRect) en ese caso recortaria mal.
   3. Cada cuadrilatero candidato se puntua con:
-       - solidity (area del contorno / area del hull convexo): la
-         tarjeta es lisa y redondeada, da solidity alta; el ruido de
-         textura de fondo da contornos mas irregulares.
+       - solidity (area del cuadrilatero ajustado / area del hull
+         convexo del contorno -- ver nota de v7 arriba sobre por que
+         ya no se usa el area del contorno crudo): la tarjeta da un
+         ajuste solido; el ruido de textura de fondo da contornos mas
+         irregulares/dispersos.
        - rect_fill (que tan bien el cuadrilatero llena un rectangulo
          de sus mismas dimensiones): descarta cuadrilateros muy
          sesgados/degenerados.
@@ -96,10 +166,11 @@ Como se encuentra la tarjeta (find_document_region / find_document_quad):
      porque el localizador no esta seguro).
   5. Con el cuadrilatero elegido se calcula una homografia
      (getPerspectiveTransform) hacia un rectangulo con un margen
-     agregado alrededor (MARGIN_FRAC_DOCUMENT), y se aplica a la foto
-     COMPLETA a color (warpPerspective) -- esto ya endereza la
-     perspectiva de la tarjeta antes de que scanner_effect() la vea,
-     ademas de eliminar el fondo.
+     agregado alrededor (ver margin_frac_for_score(), nota de v7 --
+     el margen ya no es fijo, se ajusta segun la confianza), y se
+     aplica a la foto COMPLETA a color (warpPerspective) -- esto ya
+     endereza la perspectiva de la tarjeta antes de que
+     scanner_effect() la vea, ademas de eliminar el fondo.
 
 Esta localizacion no depende de que la tarjeta este centrada: busca
 en toda la foto, no en una region fija.
@@ -203,27 +274,50 @@ _DOC_CONFIDENCE_THRESHOLD = 0.55
 # Margen agregado alrededor de la tarjeta detectada, como fraccion de
 # su ancho/alto, al enderezar la perspectiva.
 #
-# Deliberadamente generoso (20%, no un numero simbolico como 5%).
-# Motivo: el cuadrilatero candidato de find_document_quad() en la
-# practica tiende a asentarse sobre el borde impreso INTERNO de la
-# tarjeta (la linea negra redondeada), no sobre el borde real del
-# papel -- Canny+approxPolyDP encuentran el contorno mas nitido y
-# contrastado, que suele ser esa linea, no el corte del papel contra
-# el fondo (mas mixto en contraste segun la foto). Normalmente el
-# normalmente el
-# margen compensa esa diferencia sin problema, pero se detecto
-# empiricamente un caso (foto con la tarjeta mas cerca del borde del
-# encuadre y con menos contraste papel/fondo de un lado) donde un
-# margen chico (5%) no alcanzaba y el recorte terminaba cortando dentro
-# del patron impreso -- perdiendo informacion real del codigo.
+# Deliberadamente generoso (20%, no un numero simbolico como 5%) EN
+# EL EXTREMO DE BAJA CONFIANZA -- ver margin_frac_for_score() para el
+# ajuste segun score introducido en v7; esta constante ahora es el
+# extremo "candidato dudoso" de esa interpolacion, no un valor fijo
+# para todos los casos.
+#
+# Motivo del extremo generoso: el cuadrilatero candidato de
+# find_document_quad() en la practica puede asentarse sobre el borde
+# impreso INTERNO de la tarjeta (la linea negra redondeada), no sobre
+# el borde real del papel -- Canny+approxPolyDP encuentran el
+# contorno mas nitido y contrastado, que a veces es esa linea, no el
+# corte del papel contra el fondo (mas mixto en contraste segun la
+# foto). Normalmente el margen compensa esa diferencia sin problema,
+# pero se detecto empiricamente un caso (foto con la tarjeta mas
+# cerca del borde del encuadre y con menos contraste papel/fondo de
+# un lado) donde un margen chico (5%) no alcanzaba y el recorte
+# terminaba cortando dentro del patron impreso -- perdiendo
+# informacion real del codigo.
 #
 # El costo de un margen generoso es bajo (un poco mas de fondo
 # alrededor de la tarjeta en el recorte, que el rectifier tolera bien
 # -- su propia deteccion de markers ya es robusta a algo de fondo
-# alrededor); el costo de un margen chico es alto (recortar el codigo
-# real es un fallo grave, no cosmetico). Ante esa asimetria, se
-# prefiere errar generoso.
+# alrededor) SOLO cuando de verdad hace falta; el costo de un margen
+# chico en un candidato dudoso es alto (recortar el codigo real es un
+# fallo grave, no cosmetico). Ante esa asimetria, para candidatos de
+# baja confianza se sigue prefiriendo errar generoso -- pero para
+# candidatos de ALTA confianza (ver v7) ese costo generoso deja de
+# tener sentido: si el ajuste ya es pixel-perfecto sobre el borde
+# real, el margen extra es puro fondo que termina como ruido despues
+# de binarizar.
 _DOC_MARGIN_FRAC = 0.20
+
+# Margen minimo (extremo de ALTA confianza de
+# margin_frac_for_score()). Chico pero no cero: sigue dejando un
+# pelo de aire para no arriesgar cortar el patron impreso por un
+# error de redondeo de un par de px, pero ya no arrastra franjas
+# grandes de fondo/textura al recorte final.
+_DOC_MARGIN_FRAC_MIN = 0.06
+
+# Score a partir del cual se considera "alta confianza" para efectos
+# de margin_frac_for_score() (ver nota de v7). Elegido mirando los
+# scores tipicos de candidatos con rect_fill, flatness Y solidity
+# todos altos en fotos de prueba reales (~0.85+).
+_DOC_HIGH_CONFIDENCE_SCORE = 0.85
 
 # Cuanto hacia adentro del borde del cuadrilatero candidato se mide
 # la "planitud" del margen de papel (ver margin_flatness_score), como
@@ -331,7 +425,6 @@ def find_document_quad(image):
         hull_area = cv2.contourArea(hull)
         if hull_area < 1:
             continue
-        solidity = cv2.contourArea(c) / hull_area
 
         peri = cv2.arcLength(hull, True)
         approx = None
@@ -363,6 +456,23 @@ def find_document_quad(image):
         area_frac = area / img_area
         flatness = margin_flatness_score(image, quad)
 
+        # solidity (fix v7): area del CUADRILATERO YA AJUSTADO / area
+        # del hull convexo -- NO area del contorno crudo de Canny
+        # (cv2.contourArea(c)) / hull_area, que era la formula
+        # original. El contorno crudo, tras dilate+erode, suele salir
+        # como un ANILLO delgado que sigue el borde de la tarjeta: su
+        # area encerrada es minuscula comparada con su propio hull
+        # (que si es, practicamente, el rectangulo completo de la
+        # tarjeta), aun cuando el candidato es geometricamente
+        # perfecto. Eso hundia injustamente el score de candidatos
+        # correctos (se midio solidity=0.071 en un caso real con
+        # rect_fill=0.999). Usar el area del quad ya ajustado en vez
+        # del contorno crudo mide lo mismo que se queria medir
+        # (¿esto es un blob solido o algo disperso/irregular?) sin
+        # ese punto ciego. Ver nota de modulo v7 para el detalle
+        # completo y los numeros de antes/despues.
+        solidity = quad_area / hull_area
+
         # flatness pesa mas que el resto combinado: es el unico
         # criterio que distingue de forma confiable la tarjeta de un
         # parche de fondo con geometria/tamano parecidos (ver nota de
@@ -385,6 +495,35 @@ def find_document_quad(image):
             best = quad
 
     return best, best_score, candidates_info
+
+
+def margin_frac_for_score(score):
+    """
+    Nuevo en v7. Interpola el margen de recorte segun cuanto se
+    confia en el candidato detectado, en vez de usar siempre el mismo
+    margen fijo generoso (_DOC_MARGIN_FRAC).
+
+    Motivo: ese margen generoso existe como salvavidas para cuando el
+    cuadrilatero pudo haberse asentado sobre el borde impreso interno
+    de la tarjeta en vez del borde real del papel (ver nota de modulo
+    v6). Pero pagar ese costo SIEMPRE -- incluso en fotos donde el
+    candidato es un ajuste casi perfecto sobre el borde real -- deja
+    de tener sentido: ese margen extra termina siendo fondo/textura
+    que scanner_effect() despues convierte en ruido tipo
+    sal-y-pimienta, justo lo que se queria evitar.
+
+    Por eso: candidatos apenas por encima de
+    _DOC_CONFIDENCE_THRESHOLD (los mas dudosos que igual se aceptan)
+    conservan el margen generoso de siempre; candidatos de score
+    _DOC_HIGH_CONFIDENCE_SCORE o mas (rect_fill, flatness y solidity
+    todos altos) usan el margen minimo _DOC_MARGIN_FRAC_MIN.
+    Interpolacion lineal entre esos dos extremos, sin extrapolar
+    fuera de ellos (clip a [0, 1] en t).
+    """
+    lo_score, hi_score = _DOC_CONFIDENCE_THRESHOLD, _DOC_HIGH_CONFIDENCE_SCORE
+    lo_margin, hi_margin = _DOC_MARGIN_FRAC, _DOC_MARGIN_FRAC_MIN
+    t = float(np.clip((score - lo_score) / (hi_score - lo_score), 0.0, 1.0))
+    return lo_margin + (hi_margin - lo_margin) * t
 
 
 def warp_quad_with_margin(image, quad, margin_frac=_DOC_MARGIN_FRAC):
@@ -413,10 +552,12 @@ def find_document_region(image):
     """
     Localiza la tarjeta dentro de la foto (a color, sin asumir que
     este centrada) y devuelve una version recortada + con perspectiva
-    corregida, con un margen alrededor. Si no se encuentra un
-    candidato con confianza suficiente, devuelve la imagen original
-    sin modificar (fallback seguro) -- el resto del pipeline sigue
-    funcionando igual que en versiones anteriores en ese caso.
+    corregida, con un margen alrededor (margen que ahora depende de
+    la confianza del candidato -- ver margin_frac_for_score(), v7).
+    Si no se encuentra un candidato con confianza suficiente, devuelve
+    la imagen original sin modificar (fallback seguro) -- el resto
+    del pipeline sigue funcionando igual que en versiones anteriores
+    en ese caso.
 
     Devuelve (imagen_resultado, encontrado: bool, score: float).
     """
@@ -424,12 +565,13 @@ def find_document_region(image):
     if quad is None or score < _DOC_CONFIDENCE_THRESHOLD:
         return image, False, score
 
-    warped = warp_quad_with_margin(image, quad)
+    warped = warp_quad_with_margin(image, quad, margin_frac=margin_frac_for_score(score))
     return warped, True, score
 
 
 # --- scanner_effect (sin cambios de logica, solo ahora recibe la
-#     imagen ya recortada por find_document_region cuando corresponde) --
+#     imagen ya recortada -- y mas ajustada, desde v7 -- por
+#     find_document_region cuando corresponde) --
 
 def _percentile_contrast_stretch(gray, low_pct=2, high_pct=98):
     low = np.percentile(gray, low_pct)
@@ -598,7 +740,7 @@ def main():
     print("==============================")
     print(f"Input      : {input_path} ({w}x{h})")
     if found:
-        print(f"Localizacion: tarjeta encontrada, score={doc_score:.3f} -> recortada a {lw}x{lh}")
+        print(f"Localizacion: tarjeta encontrada, score={doc_score:.3f} -> recortada a {lw}x{lh} (margen={margin_frac_for_score(doc_score)*100:.0f}%)")
     else:
         print(f"Localizacion: sin candidato confiable (score={doc_score:.3f}), se uso la foto completa")
     print(f"Output     : {output_path} ({result.shape[1]}x{result.shape[0]})")
