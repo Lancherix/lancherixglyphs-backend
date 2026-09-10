@@ -147,7 +147,6 @@ EPS = 1e-9
 
 OPPOSITE_LABEL = {"TL": "BR", "TR": "BL", "BR": "TL", "BL": "TR"}
 
-MAX_CANDIDATES_FOR_QUAD_SEARCH = 12
 
 # ============================================================================
 # UTILIDADES GEOMÉTRICAS BÁSICAS
@@ -394,35 +393,32 @@ def score_quad(points):
     )
 
 
-def find_best_quad(candidates, fast_pool_size=12):
+def find_best_quad(candidates):
     if len(candidates) < 4:
         return None
 
-    pools_to_try = [candidates[:fast_pool_size]]
-    if len(candidates) > fast_pool_size:
-        pools_to_try.append(candidates)  # fallback: full search, nunca se sacrifica correctitud
+    best = None
+    best_score = -1.0
 
-    for pool in pools_to_try:
-        best = None
-        best_score = -1.0
-        for combination in itertools.combinations(pool, 4):
-            points = [candidate["center"] for candidate in combination]
-            area = polygon_area(order_quad(points))
-            if area < 1000:
-                continue
-            score = score_quad(points)
-            if score > best_score:
-                best_score = score
-                best = {
-                    "candidates": combination,
-                    "points": order_quad(points),
-                    "score": score,
-                    "area": area,
-                }
-        if best is not None:
-            return best
+    for combination in itertools.combinations(candidates, 4):
+        points = [candidate["center"] for candidate in combination]
 
-    return None
+        area = polygon_area(order_quad(points))
+        if area < 1000:
+            continue
+
+        score = score_quad(points)
+
+        if score > best_score:
+            best_score = score
+            best = {
+                "candidates": combination,
+                "points": order_quad(points),
+                "score": score,
+                "area": area,
+            }
+
+    return best
 
 
 def build_marker_results(best_quad):
